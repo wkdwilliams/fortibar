@@ -88,6 +88,11 @@ fn main() {
     #[cfg(target_os = "macos")]
     event_loop.set_activation_policy(ActivationPolicy::Accessory);
 
+    // Refresh the login item's recorded path in case the app was moved.
+    if platform::launch_at_login() {
+        platform::set_launch_at_login(true);
+    }
+
     let proxy = event_loop.create_proxy();
     let menu_proxy = proxy.clone();
     MenuEvent::set_event_handler(Some(move |e| {
@@ -255,6 +260,8 @@ impl App {
             }
         }
         let _ = menu.append(&MenuItem::with_id("log", "Show Log", !self.log.is_empty(), None));
+        let login = platform::launch_at_login();
+        let _ = menu.append(&CheckMenuItem::with_id("login", "Start at Login", true, login, None));
         let _ = menu.append(&PredefinedMenuItem::separator());
         let _ = menu.append(&MenuItem::with_id("quit", "Quit FortiBar", true, None));
     }
@@ -311,6 +318,7 @@ impl App {
                 let _ = std::fs::write(&path, self.log.iter().cloned().collect::<Vec<_>>().join("\n"));
                 platform::open_text(&path);
             }
+            "login" => platform::set_launch_at_login(!platform::launch_at_login()),
             "quit" => {
                 if let Some(t) = &self.tunnel {
                     t.stop();
