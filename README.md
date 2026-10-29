@@ -54,9 +54,11 @@ Tag a commit `v*` to attach it to a release. To build locally you need
 [Rust](https://rustup.rs) and [MSYS2](https://www.msys2.org):
 
 ```powershell
-C:\msys64\usr\bin\pacman -S mingw-w64-x86_64-openconnect unzip
+C:\msys64\usr\bin\bash -lc "pacman -S --needed make unzip mingw-w64-ucrt-x86_64-{gcc,pkgconf,gnutls,libxml2,zlib,lz4}"
 .\scripts\build-windows.ps1
 ```
+
+This builds OpenConnect 9.21 from its release tarball and bundles it with wintun. Every download is checked against a pinned SHA-256.
 
 ## Use
 

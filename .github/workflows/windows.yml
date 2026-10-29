@@ -14,14 +14,18 @@ jobs:
   build:
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - uses: msys2/setup-msys2@v2
         id: msys2
         with:
-          msystem: MINGW64
+          msystem: UCRT64
           update: true
-          install: mingw-w64-x86_64-openconnect unzip
+          install: >-
+            make unzip
+            mingw-w64-ucrt-x86_64-gcc mingw-w64-ucrt-x86_64-pkgconf
+            mingw-w64-ucrt-x86_64-gnutls mingw-w64-ucrt-x86_64-libxml2
+            mingw-w64-ucrt-x86_64-zlib mingw-w64-ucrt-x86_64-lz4
 
       - uses: actions/cache@v4
         with:
