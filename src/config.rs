@@ -8,9 +8,17 @@ use std::time::{SystemTime, UNIX_EPOCH};
 /// folder (setup.sh builds in place); on Windows it's the folder FortiBar.exe
 /// was unzipped into.
 pub fn app_dir() -> PathBuf {
+    let exe = std::env::current_exe().ok();
     #[cfg(windows)]
-    if let Some(dir) = std::env::current_exe().ok().and_then(|p| p.parent().map(PathBuf::from)) {
+    if let Some(dir) = exe.as_ref().and_then(|p| p.parent().map(PathBuf::from)) {
         return dir;
+    }
+    // Found at runtime rather than baked in, so the project folder can be
+    // moved: the nearest ancestor of dist/FortiBar.app or target/release
+    // that holds Cargo.toml.
+    #[cfg(not(windows))]
+    if let Some(dir) = exe.as_ref().and_then(|p| p.ancestors().find(|d| d.join("Cargo.toml").is_file())) {
+        return dir.to_path_buf();
     }
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
 }
