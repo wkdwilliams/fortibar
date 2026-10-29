@@ -274,7 +274,8 @@ impl App {
         let title = match &self.status {
             Status::Connected(id) => Some(self.vpn_name(id)),
             Status::SigningIn(_) | Status::Connecting(_) | Status::Disconnecting(_) => Some("…".to_string()),
-            Status::Idle => None,
+            // tray-icon ignores a None title on macOS, leaving the old one up.
+            Status::Idle => Some(String::new()),
         };
         if let Some(tray) = &self.tray {
             tray.set_menu(Some(Box::new(menu)));
