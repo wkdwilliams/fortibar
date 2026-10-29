@@ -1,0 +1,76 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<style>
+  :root { color-scheme: light dark; --bg:#f7f8fb; --fg:#2c3e50; --label:#5b7083; --border:#b9c2cc; --accent:#1d8fe8; --btn:#0a78c2; --err:#c0392b; }
+  @media (prefers-color-scheme: dark) { :root { --bg:#1e2227; --fg:#e6e9ee; --label:#9fb0c2; --border:#475260; --accent:#2f9bff; --btn:#1a7fd0; } }
+  * { box-sizing: border-box; }
+  body { margin:0; padding:22px 30px; background:var(--bg); color:var(--fg); font:14px -apple-system, BlinkMacSystemFont, sans-serif; user-select:none; }
+  h1 { font-weight:400; font-size:24px; text-align:center; margin:0 0 20px; color:var(--label); }
+  .row { display:grid; grid-template-columns:140px 1fr; align-items:center; gap:12px; margin-bottom:12px; }
+  label.l { color:var(--label); }
+  input[type=text], input[type=number] { width:100%; padding:7px 9px; border:1px solid var(--border); border-radius:4px; background:transparent; color:var(--fg); font-size:14px; user-select:text; }
+  input:focus { outline:2px solid var(--accent); outline-offset:-1px; }
+  .seg { display:flex; border:1px solid var(--accent); border-radius:4px; overflow:hidden; width:max-content; }
+  .seg span { padding:5px 16px; font-weight:600; font-size:13px; }
+  .seg .on { background:var(--accent); color:#fff; }
+  .seg .off { opacity:.4; }
+  .check { display:flex; align-items:center; gap:10px; }
+  .check input[type=number] { width:90px; }
+  .hint { color:var(--label); font-size:12px; margin-top:4px; }
+  .err { color:var(--err); min-height:18px; text-align:center; margin:4px 0 8px; }
+  .buttons { display:flex; justify-content:center; gap:16px; }
+  button { width:150px; padding:10px; border:0; border-radius:4px; background:var(--btn); color:#fff; font-size:16px; cursor:pointer; }
+  button:active { filter:brightness(.9); }
+</style>
+</head>
+<body>
+<h1 id="title">New VPN Connection</h1>
+<form id="f" autocomplete="off">
+  <div class="row"><label class="l">VPN</label>
+    <div class="seg"><span class="on">SSL-VPN</span><span class="off">SSO (SAML)</span></div></div>
+  <div class="row"><label class="l" for="name">Connection Name</label><input type="text" id="name" required></div>
+  <div class="row"><label class="l" for="description">Description</label><input type="text" id="description"></div>
+  <div class="row"><label class="l" for="gateway">Remote Gateway</label>
+    <div><input type="text" id="gateway" placeholder="vpn.hospital.org" required>
+    <div class="hint">Hostname, host:port, or a pasted URL</div></div></div>
+  <div class="row"><span></span>
+    <div class="check"><input type="checkbox" id="customPort"><label for="customPort">Customize port</label>
+    <input type="number" id="port" value="443" min="1" max="65535" disabled></div></div>
+  <div class="row"><label class="l" for="trustedCert">Trusted Cert</label>
+    <div><input type="text" id="trustedCert" placeholder="optional SHA-256 digest">
+    <div class="hint">Only for gateways with a self-signed certificate. You'll be asked if it's needed.</div></div></div>
+  <div class="err" id="err"></div>
+  <div class="buttons"><button type="button" id="cancel">Cancel</button><button type="submit">Save</button></div>
+</form>
+<script>
+  const $ = id => document.getElementById(id);
+  const send = msg => window.ipc.postMessage(JSON.stringify(msg));
+  $('customPort').onchange = () => { $('port').disabled = !$('customPort').checked; };
+  const v = window.__VPN;
+  if (v) {
+    $('title').textContent = 'Edit VPN Connection';
+    $('name').value = v.name; $('description').value = v.description;
+    $('gateway').value = v.host; $('trustedCert').value = v.trusted_cert;
+    if (v.port !== 443) { $('customPort').checked = true; $('port').disabled = false; $('port').value = v.port; }
+  }
+  $('cancel').onclick = () => send({ action: 'cancel' });
+  document.addEventListener('keydown', e => { if (e.key === 'Escape') send({ action: 'cancel' }); });
+  $('f').onsubmit = e => {
+    e.preventDefault();
+    send({
+      action: 'save',
+      id: v ? v.id : null,
+      name: $('name').value.trim(),
+      description: $('description').value.trim(),
+      gateway: $('gateway').value.trim(),
+      port: $('customPort').checked ? Number($('port').value) : null,
+      trusted_cert: $('trustedCert').value.trim().replace(/:/g, ''),
+    });
+  };
+  window.showError = msg => { $('err').textContent = msg; };
+  $('name').focus();
+</script>
+</body>
+</html>

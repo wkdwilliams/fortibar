@@ -1,0 +1,13 @@
+# Build output and local Rust crate cache
+/target/
+/.cargo/
+/dist/
+
+# openfortivpn source/build and the root-owned helper (built by setup.sh)
+/vendor/
+
+# Your VPN list and saved login cookies — never commit
+/data/
+
+.DS_Store
+*.log
