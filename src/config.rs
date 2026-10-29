@@ -4,18 +4,42 @@ use std::hash::{BuildHasher, Hasher};
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-pub const ROOT: &str = env!("CARGO_MANIFEST_DIR");
+/// Where data/ and the tunnel program live. On macOS that's the project
+/// folder (setup.sh builds in place); on Windows it's the folder FortiBar.exe
+/// was unzipped into.
+pub fn app_dir() -> PathBuf {
+    #[cfg(windows)]
+    if let Some(dir) = std::env::current_exe().ok().and_then(|p| p.parent().map(PathBuf::from)) {
+        return dir;
+    }
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+}
 
 pub fn data_dir() -> PathBuf {
-    let dir = PathBuf::from(ROOT).join("data");
+    let dir = app_dir().join("data");
     let _ = std::fs::create_dir_all(&dir);
     // Holds saved login cookies; keep it private to this user.
+    #[cfg(unix)]
     let _ = std::fs::set_permissions(&dir, std::os::unix::fs::PermissionsExt::from_mode(0o700));
     dir
 }
 
-pub fn helper_path() -> PathBuf {
-    PathBuf::from(ROOT).join("vendor/bin/fortivpn-helper")
+/// macOS: root helper wrapping openfortivpn. Windows: bundled openconnect.
+pub fn tunnel_program() -> PathBuf {
+    #[cfg(target_os = "macos")]
+    return app_dir().join("vendor/bin/fortivpn-helper");
+    #[cfg(windows)]
+    return app_dir().join("openconnect").join("openconnect.exe");
+}
+
+/// Hex SHA-256 of the certificate, or (Windows/openconnect) a `pin-sha256:`
+/// public-key pin as openconnect suggests it.
+pub fn valid_cert(s: &str) -> bool {
+    let hex = s.len() == 64 && s.chars().all(|c| c.is_ascii_hexdigit());
+    let pin = s.strip_prefix("pin-sha256:").is_some_and(|b| {
+        !b.is_empty() && b.chars().all(|c| c.is_ascii_alphanumeric() || "+/=".contains(c))
+    });
+    hex || pin
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -45,14 +69,21 @@ impl Vpn {
         format!("{}:{}", self.host, self.port)
     }
 
-    /// Identifier of this VPN's private WebKit profile, so each hospital keeps
+    /// Identifier of this VPN's private WebKit profile, so each VPN keeps
     /// its own Microsoft login.
+    #[cfg(target_os = "macos")]
     pub fn store_id(&self) -> [u8; 16] {
         let mut out = [0u8; 16];
         for (i, b) in out.iter_mut().enumerate() {
             *b = u8::from_str_radix(self.id.get(i * 2..i * 2 + 2).unwrap_or("00"), 16).unwrap_or(0);
         }
         out
+    }
+
+    /// This VPN's private WebView2 profile folder (Windows).
+    #[cfg(windows)]
+    pub fn profile_dir(&self) -> PathBuf {
+        data_dir().join("profiles").join(&self.id)
     }
 
     pub fn cookie_file(&self) -> PathBuf {
@@ -122,6 +153,15 @@ mod tests {
         assert_eq!(parse_gateway(""), None);
     }
 
+    #[test]
+    fn validates_certs() {
+        assert!(valid_cert("b075ab189818ed1e4a91858e0ccc4d412293ae88dc1ce981e5f5808a8b3fc200"));
+        assert!(valid_cert("pin-sha256:ABCdef+/123="));
+        assert!(!valid_cert("pin-sha256:"));
+        assert!(!valid_cert("zz"));
+    }
+
+    #[cfg(target_os = "macos")]
     #[test]
     fn store_id_is_stable_and_distinct() {
         let a = Vpn { id: new_id(), name: "a".into(), description: String::new(), host: "h".into(), port: 443, trusted_cert: String::new() };

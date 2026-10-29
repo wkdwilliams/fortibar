@@ -21,9 +21,15 @@ fn inside(u: f32, v: f32, inset: f32) -> bool {
     u.abs() <= shield_width(v)
 }
 
-/// Template image of a shield: outlined when disconnected, filled when
-/// connected. macOS tints template images to match the menu bar.
+/// A shield: outlined when disconnected, filled when connected. On macOS it's
+/// a black template image the system tints to match the menu bar; Windows
+/// has no template images, so it's drawn in colour (blue when connected).
 pub fn shield(filled: bool) -> Icon {
+    #[cfg(target_os = "macos")]
+    let rgb = [0, 0, 0];
+    #[cfg(windows)]
+    let rgb = if filled { [0x1d, 0x8f, 0xe8] } else { [0xa0, 0xa6, 0xad] };
+
     let mut rgba = Vec::with_capacity((SIZE * SIZE * 4) as usize);
     for y in 0..SIZE {
         for x in 0..SIZE {
@@ -41,7 +47,7 @@ pub fn shield(filled: bool) -> Icon {
                 }
             }
             let alpha = (hits * 255 / (SAMPLES * SAMPLES)) as u8;
-            rgba.extend_from_slice(&[0, 0, 0, alpha]);
+            rgba.extend_from_slice(&[rgb[0], rgb[1], rgb[2], alpha]);
         }
     }
     Icon::from_rgba(rgba, SIZE, SIZE).expect("valid icon")

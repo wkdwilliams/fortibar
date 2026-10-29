@@ -1,22 +1,31 @@
+#![cfg_attr(windows, windows_subsystem = "windows")]
+
 mod config;
 mod icon;
+mod platform;
+#[cfg(target_os = "macos")]
 mod tls;
 mod tunnel;
 
 use config::Vpn;
+use platform::{alert, confirm, notify};
 use std::collections::{HashMap, VecDeque};
-use std::process::Command;
 use std::time::Duration;
 use tao::dpi::{LogicalPosition, LogicalSize};
 use tao::event::{Event, StartCause, WindowEvent};
 use tao::event_loop::{ControlFlow, EventLoopBuilder, EventLoopProxy, EventLoopWindowTarget};
+#[cfg(target_os = "macos")]
 use tao::platform::macos::{ActivationPolicy, EventLoopExtMacOS};
 use tao::window::{Window, WindowBuilder};
 use tray_icon::menu::{CheckMenuItem, Menu, MenuEvent, MenuItem, PredefinedMenuItem, Submenu};
 use tray_icon::{TrayIcon, TrayIconBuilder};
 use tunnel::Tunnel;
 use wry::cookie::{Cookie, Expiration};
-use wry::{PageLoadEvent, WebView, WebViewBuilder, WebViewBuilderExtDarwin};
+use wry::{PageLoadEvent, WebView, WebViewBuilder};
+#[cfg(windows)]
+use wry::WebContext;
+#[cfg(target_os = "macos")]
+use wry::WebViewBuilderExtDarwin;
 
 const SESSION_COOKIE: &str = "SVPNCOOKIE";
 
@@ -49,6 +58,9 @@ type Target = EventLoopWindowTarget<UserEvent>;
 struct AuthWindow {
     window: Window,
     webview: WebView,
+    /// This VPN's WebView2 profile folder; must outlive the webview.
+    #[cfg(windows)]
+    _context: WebContext,
 }
 
 struct App {
@@ -71,7 +83,9 @@ struct App {
 }
 
 fn main() {
+    #[allow(unused_mut)]
     let mut event_loop = EventLoopBuilder::<UserEvent>::with_user_event().build();
+    #[cfg(target_os = "macos")]
     event_loop.set_activation_policy(ActivationPolicy::Accessory);
 
     let proxy = event_loop.create_proxy();
@@ -126,6 +140,12 @@ fn main() {
 }
 
 impl App {
+    #[cfg(windows)]
+    fn init(&mut self, _target: &Target) {
+        self.create_tray();
+    }
+
+    #[cfg(target_os = "macos")]
     fn init(&mut self, target: &Target) {
         // wry registers its delegate class lazily; build a throwaway webview
         // so it exists, then teach it to accept pinned gateway certificates.
@@ -152,7 +172,10 @@ impl App {
         let _ = app_menu.append_items(&[&app_sub, &edit]);
         app_menu.init_for_nsapp();
         self._app_menu = Some(app_menu);
+        self.create_tray();
+    }
 
+    fn create_tray(&mut self) {
         self.tray = TrayIconBuilder::new()
             .with_icon(icon::shield(false))
             .with_icon_as_template(true)
@@ -189,15 +212,23 @@ impl App {
 
     fn build_menu(&self) -> Menu {
         let menu = Menu::new();
-        let status = match &self.status {
+        let _ = menu.append(&MenuItem::new(self.status_text(), false, None));
+        let _ = menu.append(&PredefinedMenuItem::separator());
+        self.append_items(&menu);
+        menu
+    }
+
+    fn status_text(&self) -> String {
+        match &self.status {
             Status::Idle => "Not connected".to_string(),
             Status::SigningIn(id) => format!("Signing in to {}…", self.vpn_name(id)),
             Status::Connecting(id) => format!("Connecting to {}…", self.vpn_name(id)),
             Status::Connected(id) => format!("Connected to {}", self.vpn_name(id)),
             Status::Disconnecting(id) => format!("Disconnecting from {}…", self.vpn_name(id)),
-        };
-        let _ = menu.append(&MenuItem::new(status, false, None));
-        let _ = menu.append(&PredefinedMenuItem::separator());
+        }
+    }
+
+    fn append_items(&self, menu: &Menu) {
 
         if self.vpns.is_empty() {
             let _ = menu.append(&MenuItem::new("No VPNs yet", false, None));
@@ -226,10 +257,10 @@ impl App {
         let _ = menu.append(&MenuItem::with_id("log", "Show Log", !self.log.is_empty(), None));
         let _ = menu.append(&PredefinedMenuItem::separator());
         let _ = menu.append(&MenuItem::with_id("quit", "Quit FortiBar", true, None));
-        menu
     }
 
     fn refresh(&mut self) {
+        #[cfg(target_os = "macos")]
         tls::set_pins(&self.vpns);
         let menu = self.build_menu();
         let connected = matches!(self.status, Status::Connected(_));
@@ -240,6 +271,9 @@ impl App {
         };
         if let Some(tray) = &self.tray {
             tray.set_menu(Some(Box::new(menu)));
+            // Title text shows next to the icon on macOS; Windows only has the tooltip.
+            let tooltip = format!("FortiBar – {}", self.status_text());
+            let _ = tray.set_tooltip(Some(tooltip));
             tray.set_title(title);
             let _ = tray.set_icon_with_as_template(Some(icon::shield(connected)), true);
         }
@@ -275,7 +309,7 @@ impl App {
             "log" => {
                 let path = config::data_dir().join("fortibar.log");
                 let _ = std::fs::write(&path, self.log.iter().cloned().collect::<Vec<_>>().join("\n"));
-                let _ = Command::new("open").arg("-e").arg(path).spawn();
+                platform::open_text(&path);
             }
             "quit" => {
                 if let Some(t) = &self.tunnel {
@@ -372,8 +406,16 @@ impl App {
         let load_proxy = self.proxy.clone();
         let nav_id = vpn.id.clone();
         let load_id = vpn.id.clone();
-        let webview = WebViewBuilder::new()
-            .with_data_store_identifier(vpn.store_id())
+        // Each VPN gets its own browser profile, so each keeps its own
+        // Microsoft login even when several share one gateway.
+        #[cfg(target_os = "macos")]
+        let builder = WebViewBuilder::new().with_data_store_identifier(vpn.store_id());
+        #[cfg(windows)]
+        let mut context = WebContext::new(Some(vpn.profile_dir()));
+        #[cfg(windows)]
+        let builder = WebViewBuilder::new_with_web_context(&mut context);
+
+        let webview = builder
             .with_navigation_handler(move |url| {
                 let local = url.starts_with("http://127.0.0.1:8020") || url.starts_with("http://localhost:8020");
                 if local {
@@ -392,7 +434,15 @@ impl App {
             .expect("create sign-in webview");
 
         restore_session_cookies(vpn, &webview);
-        self.auth.insert(vpn.id.clone(), AuthWindow { window, webview });
+        self.auth.insert(
+            vpn.id.clone(),
+            AuthWindow {
+                window,
+                webview,
+                #[cfg(windows)]
+                _context: context,
+            },
+        );
     }
 
     fn forget_login(&mut self, target: &Target, id: &str) {
@@ -421,9 +471,15 @@ impl App {
     }
 
     fn start_tunnel(&mut self, vpn: &Vpn, cookie: &str) {
-        if !config::helper_path().exists() {
+        if !config::tunnel_program().exists() {
             self.status = Status::Idle;
+            #[cfg(target_os = "macos")]
             alert("FortiBar isn't set up yet", "Run ./setup.sh in the FortiBar folder once, then try again.");
+            #[cfg(windows)]
+            alert(
+                "openconnect is missing",
+                "The openconnect folder should sit next to FortiBar.exe. Re-extract the FortiBar zip.",
+            );
             return;
         }
         self.session += 1;
@@ -489,7 +545,8 @@ impl App {
         if self.tunnel.as_ref().map(|t| t.session) != Some(session) {
             return;
         }
-        if line.contains("Tunnel is up and running") {
+        // openfortivpn / openconnect respectively.
+        if line.contains("Tunnel is up and running") || line.contains("Configured as ") {
             if let Status::Connecting(id) = &self.status {
                 let id = id.clone();
                 notify("VPN connected", &self.vpn_name(&id));
@@ -500,9 +557,12 @@ impl App {
         if line.contains("a password is required") || line.contains("a terminal is required") {
             self.sudo_failed = true;
         }
-        if let Some(rest) = line.split("--trusted-cert").nth(1) {
-            let digest = rest.trim().split_whitespace().next().unwrap_or("");
-            if digest.len() == 64 && digest.chars().all(|c| c.is_ascii_hexdigit()) {
+        // Both tools print the flag to add when the gateway certificate isn't
+        // trusted: openfortivpn --trusted-cert <hex>, openconnect --servercert <pin>.
+        let suggestion = line.split("--trusted-cert").nth(1).or_else(|| line.split("--servercert").nth(1));
+        if let Some(rest) = suggestion {
+            let digest = rest.trim_start_matches([' ', '=']).split_whitespace().next().unwrap_or("");
+            if config::valid_cert(digest) {
                 self.pending_cert = Some(digest.to_string());
             }
         }
@@ -610,15 +670,18 @@ impl App {
             return show_error("Enter a connection name.");
         }
         let Some((host, gw_port)) = config::parse_gateway(&s("gateway")) else {
-            return show_error("Enter a valid gateway, e.g. vpn.hospital.org or vpn.hospital.org:10443");
+            return show_error("Enter a valid gateway, e.g. vpn.example.com or vpn.example.com:10443");
         };
         let port = match msg["port"].as_u64() {
             Some(p) if (1..=65535).contains(&p) => p as u16,
             Some(_) => return show_error("Port must be between 1 and 65535."),
             None => gw_port.unwrap_or(443),
         };
-        let trusted_cert = s("trusted_cert").to_ascii_lowercase();
-        if !trusted_cert.is_empty() && !(trusted_cert.len() == 64 && trusted_cert.chars().all(|c| c.is_ascii_hexdigit())) {
+        let mut trusted_cert = s("trusted_cert");
+        if !trusted_cert.starts_with("pin-sha256:") {
+            trusted_cert.make_ascii_lowercase();
+        }
+        if !trusted_cert.is_empty() && !config::valid_cert(&trusted_cert) {
             return show_error("Trusted cert must be a 64-character SHA-256 hex digest.");
         }
 
@@ -666,18 +729,16 @@ fn query_param(url: &str, key: &str) -> Option<String> {
 /// off) die with the app. Save them per VPN so a restart still logs in
 /// silently. Persistent cookies are already kept by the WebKit profile.
 fn save_session_cookies(vpn: &Vpn, cookies: &[Cookie<'static>]) {
-    use std::os::unix::fs::OpenOptionsExt;
     let lines: Vec<String> = cookies
         .iter()
         .filter(|c| c.name() != SESSION_COOKIE && matches!(c.expires(), None | Some(Expiration::Session)))
         .map(|c| c.to_string())
         .collect();
-    let file = std::fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .mode(0o600)
-        .open(vpn.cookie_file());
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+    let file = options.open(vpn.cookie_file());
     if let Ok(mut f) = file {
         use std::io::Write;
         let _ = f.write_all(lines.join("\n").as_bytes());
@@ -691,44 +752,6 @@ fn restore_session_cookies(vpn: &Vpn, webview: &WebView) {
             let _ = webview.set_cookie(&c);
         }
     }
-}
-
-fn applescript_str(s: &str) -> String {
-    format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""))
-}
-
-fn notify(title: &str, message: &str) {
-    let script = format!(
-        "display notification {} with title {}",
-        applescript_str(message),
-        applescript_str(title)
-    );
-    let _ = Command::new("osascript").arg("-e").arg(script).spawn();
-}
-
-fn alert(title: &str, message: &str) {
-    let script = format!(
-        "display alert {} message {} as warning",
-        applescript_str(title),
-        applescript_str(message)
-    );
-    std::thread::spawn(move || {
-        let _ = Command::new("osascript").arg("-e").arg(script).status();
-    });
-}
-
-fn confirm(message: &str, ok: &str) -> bool {
-    let script = format!(
-        "display dialog {} with title \"FortiBar\" buttons {{\"Cancel\", {ok}}} default button {ok} cancel button \"Cancel\" with icon caution",
-        applescript_str(message),
-        ok = applescript_str(ok)
-    );
-    Command::new("osascript")
-        .arg("-e")
-        .arg(script)
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
 }
 
 #[cfg(test)]
