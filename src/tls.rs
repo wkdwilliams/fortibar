@@ -5,6 +5,9 @@
 //! wry's navigation delegate doesn't handle auth challenges, so we add
 //! `webView:didReceiveAuthenticationChallenge:completionHandler:` to its class
 //! at runtime.
+//!
+//! ATS would still fail the connection even after we accept the certificate,
+//! so the app's Info.plist sets NSAllowsArbitraryLoadsInWebContent (setup.sh).
 
 use crate::config::Vpn;
 use block2::Block;

@@ -72,6 +72,9 @@ build_app() {
 	  <key>CFBundlePackageType</key><string>APPL</string>
 	  <key>CFBundleVersion</key><string>0.1.0</string>
 	  <key>LSUIElement</key><true/>
+	  <!-- Without this, ATS fails sign-in to a gateway whose certificate macOS
+	       rejects, even after our pinned-certificate check (src/tls.rs) accepts it. -->
+	  <key>NSAppTransportSecurity</key><dict><key>NSAllowsArbitraryLoadsInWebContent</key><true/></dict>
 	  <key>LSMinimumSystemVersion</key><string>14.0</string>
 	</dict></plist>
 	EOF
