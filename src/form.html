@@ -18,6 +18,9 @@
   .seg .off { opacity:.4; }
   .check { display:flex; align-items:center; gap:10px; }
   .check input[type=number] { width:90px; }
+  .radios { display:flex; gap:22px; }
+  .radios label { display:flex; align-items:center; gap:6px; }
+  .hidden { display:none; }
   .hint { color:var(--label); font-size:12px; margin-top:4px; }
   .err { color:var(--err); min-height:18px; text-align:center; margin:4px 0 8px; }
   .buttons { display:flex; justify-content:center; gap:16px; }
@@ -29,7 +32,7 @@
 <h1 id="title">New VPN Connection</h1>
 <form id="f" autocomplete="off">
   <div class="row"><label class="l">VPN</label>
-    <div class="seg"><span class="on">SSL-VPN</span><span class="off">SSO (SAML)</span></div></div>
+    <div class="seg"><span class="on">SSL-VPN</span></div></div>
   <div class="row"><label class="l" for="name">Connection Name</label><input type="text" id="name" required></div>
   <div class="row"><label class="l" for="description">Description</label><input type="text" id="description"></div>
   <div class="row"><label class="l" for="gateway">Remote Gateway</label>
@@ -38,6 +41,15 @@
   <div class="row"><span></span>
     <div class="check"><input type="checkbox" id="customPort"><label for="customPort">Customize port</label>
     <input type="number" id="port" value="443" min="1" max="65535" disabled></div></div>
+  <div class="row"><span></span>
+    <div class="check"><input type="checkbox" id="sso" checked><label for="sso">Enable Single Sign On (SSO) for VPN Tunnel</label></div></div>
+  <div class="row pw"><label class="l">Authentication</label>
+    <div class="radios">
+      <label><input type="radio" name="auth" id="prompt">Prompt on login</label>
+      <label><input type="radio" name="auth" id="save" checked>Save login</label></div></div>
+  <div class="row pw"><label class="l" for="username">Username</label>
+    <div><input type="text" id="username">
+    <div class="hint" id="authHint"></div></div></div>
   <div class="row"><label class="l" for="trustedCert">Trusted Cert</label>
     <div><input type="text" id="trustedCert" placeholder="optional SHA-256 digest">
     <div class="hint">Only for gateways with a self-signed certificate. You'll be asked if it's needed.</div></div></div>
@@ -48,13 +60,25 @@
   const $ = id => document.getElementById(id);
   const send = msg => window.ipc.postMessage(JSON.stringify(msg));
   $('customPort').onchange = () => { $('port').disabled = !$('customPort').checked; };
+  const syncAuth = () => {
+    const sso = $('sso').checked;
+    document.querySelectorAll('.pw').forEach(r => r.classList.toggle('hidden', sso));
+    $('authHint').textContent = $('save').checked
+      ? 'You’re asked for the password on the first connect; it’s then kept in the '
+        + (navigator.platform.startsWith('Win') ? 'Windows Credential Manager.' : 'macOS Keychain.')
+      : 'You’re asked for the password every time you connect.';
+  };
+  $('sso').onchange = $('prompt').onchange = $('save').onchange = syncAuth;
   const v = window.__VPN;
   if (v) {
     $('title').textContent = 'Edit VPN Connection';
     $('name').value = v.name; $('description').value = v.description;
     $('gateway').value = v.host; $('trustedCert').value = v.trusted_cert;
     if (v.port !== 443) { $('customPort').checked = true; $('port').disabled = false; $('port').value = v.port; }
+    $('sso').checked = v.sso; $('username').value = v.username;
+    $(v.sso || v.save_login ? 'save' : 'prompt').checked = true;
   }
+  syncAuth();
   $('cancel').onclick = () => send({ action: 'cancel' });
   document.addEventListener('keydown', e => { if (e.key === 'Escape') send({ action: 'cancel' }); });
   $('f').onsubmit = e => {
@@ -67,6 +91,9 @@
       gateway: $('gateway').value.trim(),
       port: $('customPort').checked ? Number($('port').value) : null,
       trusted_cert: $('trustedCert').value.trim().replace(/:/g, ''),
+      sso: $('sso').checked,
+      save_login: $('save').checked,
+      username: $('username').value.trim(),
     });
   };
   window.showError = msg => { $('err').textContent = msg; };

@@ -9,4 +9,6 @@ sudo rm -rf "$ROOT/vendor/bin"
 # Per-VPN browser profiles (Microsoft login cookies) kept by WebKit.
 rm -rf "$HOME/Library/WebKit/local.fortibar" "$HOME/Library/WebKit/fortibar" \
 	"$HOME/Library/Caches/local.fortibar" "$HOME/Library/Caches/fortibar"
+# Saved passwords for password VPNs (Keychain service "FortiBar").
+while security delete-generic-password -s FortiBar >/dev/null 2>&1; do :; done
 echo "Removed. You can now delete $ROOT"

@@ -19,7 +19,7 @@ use tao::platform::macos::{ActivationPolicy, EventLoopExtMacOS};
 use tao::window::{Window, WindowBuilder};
 use tray_icon::menu::{CheckMenuItem, Menu, MenuEvent, MenuItem, PredefinedMenuItem, Submenu};
 use tray_icon::{TrayIcon, TrayIconBuilder};
-use tunnel::Tunnel;
+use tunnel::{Auth, Tunnel};
 use wry::cookie::{Cookie, Expiration};
 use wry::{PageLoadEvent, WebView, WebViewBuilder};
 #[cfg(windows)]
@@ -39,6 +39,8 @@ pub enum UserEvent {
     /// Sign-in didn't complete silently; show the window to the user.
     AuthReveal(String, u64),
     Form(String),
+    /// Username/password window for VPNs that don't use SSO.
+    Login(String),
     TunnelLine(u64, String),
     TunnelExited(u64, Option<i32>),
 }
@@ -63,6 +65,15 @@ struct AuthWindow {
     _context: WebContext,
 }
 
+/// Credentials the current tunnel was started with, kept until it's up so a
+/// certificate-trust retry doesn't ask again and a typed password can be
+/// saved once it's proven right.
+struct PasswordLogin {
+    username: String,
+    password: String,
+    typed: bool,
+}
+
 struct App {
     proxy: EventLoopProxy<UserEvent>,
     vpns: Vec<Vpn>,
@@ -70,6 +81,8 @@ struct App {
     _app_menu: Option<Menu>,
     auth: HashMap<String, AuthWindow>,
     form: Option<(Window, WebView)>,
+    /// Password prompt and the VPN it's for.
+    login: Option<(String, Window, WebView)>,
     status: Status,
     tunnel: Option<Tunnel>,
     /// VPN to connect to once the current tunnel has shut down.
@@ -77,6 +90,9 @@ struct App {
     /// Certificate digest openfortivpn asked us to trust, if any.
     pending_cert: Option<String>,
     sudo_failed: bool,
+    /// The gateway rejected the username or password.
+    auth_failed: bool,
+    password_login: Option<PasswordLogin>,
     attempt: u64,
     session: u64,
     log: VecDeque<String>,
@@ -106,11 +122,14 @@ fn main() {
         _app_menu: None,
         auth: HashMap::new(),
         form: None,
+        login: None,
         status: Status::Idle,
         tunnel: None,
         next_vpn: None,
         pending_cert: None,
         sudo_failed: false,
+        auth_failed: false,
+        password_login: None,
         attempt: 0,
         session: 0,
         log: VecDeque::new(),
@@ -129,6 +148,8 @@ fn main() {
             Event::WindowEvent { window_id, event: WindowEvent::CloseRequested, .. } => {
                 if app.form.as_ref().is_some_and(|(w, _)| w.id() == window_id) {
                     app.form = None;
+                } else if app.login.as_ref().is_some_and(|(_, w, _)| w.id() == window_id) {
+                    app.cancel_login();
                 } else if let Some(id) =
                     app.auth.iter().find(|(_, a)| a.window.id() == window_id).map(|(id, _)| id.clone())
                 {
@@ -298,7 +319,8 @@ impl App {
             "edit" => self.open_form(target, self.vpn(&vpn_id).cloned()),
             "forget" => {
                 let name = self.vpn_name(&vpn_id);
-                if confirm(&format!("Forget the saved Microsoft login for {name}?"), "Forget") {
+                let what = if self.vpn(&vpn_id).is_some_and(|v| v.sso) { "Microsoft login" } else { "password" };
+                if confirm(&format!("Forget the saved {what} for {name}?"), "Forget") {
                     self.forget_login(target, &vpn_id);
                 }
             }
@@ -340,7 +362,9 @@ impl App {
             // Clicking the active VPN toggles it off.
             Status::Connected(cur) | Status::Connecting(cur) if *cur == id => return self.disconnect(),
             Status::SigningIn(cur) if *cur == id => {
-                if let Some(a) = self.auth.get(&id) {
+                if let Some((_, w, _)) = &self.login {
+                    w.set_focus();
+                } else if let Some(a) = self.auth.get(&id) {
                     a.window.set_visible(true);
                     a.window.set_focus();
                 }
@@ -350,6 +374,7 @@ impl App {
                 if let Some(a) = self.auth.get(cur) {
                     a.window.set_visible(false);
                 }
+                self.login = None;
             }
             _ => {}
         }
@@ -373,15 +398,52 @@ impl App {
             if let Some(a) = self.auth.get(id) {
                 a.window.set_visible(false);
             }
+            self.login = None;
             self.status = Status::Idle;
         }
     }
 
+    /// The password window was closed or cancelled.
+    fn cancel_login(&mut self) {
+        if let Some((id, _, _)) = self.login.take() {
+            if matches!(&self.status, Status::SigningIn(s) if *s == id) {
+                self.status = Status::Idle;
+                self.refresh();
+            }
+        }
+    }
+
     fn start_auth(&mut self, target: &Target, id: &str) {
+        self.start_auth_with(target, id, None);
+    }
+
+    /// `retry` carries the credentials of a password tunnel being restarted
+    /// (after trusting its certificate), so the user isn't asked again.
+    fn start_auth_with(&mut self, target: &Target, id: &str, retry: Option<PasswordLogin>) {
         let Some(vpn) = self.vpn(id).cloned() else { return };
+        if vpn.sso {
+            return self.start_saml(target, &vpn);
+        }
+        self.status = Status::SigningIn(id.to_string());
+        let saved = || {
+            let password = (!vpn.username.is_empty() && vpn.save_login).then(|| vpn.saved_password()).flatten()?;
+            Some(PasswordLogin { username: vpn.username.clone(), password, typed: false })
+        };
+        match retry.or_else(saved) {
+            Some(login) => self.start_tunnel(&vpn, Auth::Password {
+                username: login.username.clone(),
+                password: login.password.clone(),
+            }, Some(login)),
+            None => self.open_login(target, &vpn, ""),
+        }
+        self.refresh();
+    }
+
+    fn start_saml(&mut self, target: &Target, vpn: &Vpn) {
+        let id = vpn.id.as_str();
         self.attempt += 1;
         self.status = Status::SigningIn(id.to_string());
-        self.ensure_auth_window(target, &vpn);
+        self.ensure_auth_window(target, vpn);
 
         let webview = &self.auth[id].webview;
         // Drop any old session cookie so we only pick up a fresh one.
@@ -456,6 +518,10 @@ impl App {
 
     fn forget_login(&mut self, target: &Target, id: &str) {
         let Some(vpn) = self.vpn(id).cloned() else { return };
+        vpn.forget_password();
+        if !vpn.sso && !self.auth.contains_key(id) && !vpn.cookie_file().exists() {
+            return;
+        }
         self.ensure_auth_window(target, &vpn);
         let _ = self.auth[id].webview.clear_all_browsing_data();
         let _ = std::fs::remove_file(vpn.cookie_file());
@@ -479,7 +545,7 @@ impl App {
         Some(value)
     }
 
-    fn start_tunnel(&mut self, vpn: &Vpn, cookie: &str) {
+    fn start_tunnel(&mut self, vpn: &Vpn, auth: Auth, password_login: Option<PasswordLogin>) {
         if !config::tunnel_program().exists() {
             self.status = Status::Idle;
             #[cfg(target_os = "macos")]
@@ -494,8 +560,10 @@ impl App {
         self.session += 1;
         self.pending_cert = None;
         self.sudo_failed = false;
+        self.auth_failed = false;
+        self.password_login = password_login;
         self.log.clear();
-        match Tunnel::start(vpn, cookie, self.session, self.proxy.clone()) {
+        match Tunnel::start(vpn, &auth, self.session, self.proxy.clone()) {
             Ok(t) => {
                 self.tunnel = Some(t);
                 self.status = Status::Connecting(vpn.id.clone());
@@ -520,7 +588,7 @@ impl App {
                 let Some(vpn) = self.vpn(&id).cloned() else { return };
                 if let Some(cookie) = self.find_session_cookie(&vpn) {
                     self.auth[&id].window.set_visible(false);
-                    self.start_tunnel(&vpn, &cookie);
+                    self.start_tunnel(&vpn, Auth::Cookie(cookie), None);
                     self.refresh();
                 } else if let Some(a) = attempt {
                     self.later(Duration::from_millis(800), UserEvent::AuthCheck(id, Some(a)));
@@ -545,6 +613,7 @@ impl App {
                 }
             }
             UserEvent::Form(body) => self.on_form(body),
+            UserEvent::Login(body) => self.on_login(body),
             UserEvent::TunnelLine(session, line) => self.on_tunnel_line(session, line),
             UserEvent::TunnelExited(session, code) => self.on_tunnel_exit(target, session, code),
         }
@@ -558,6 +627,12 @@ impl App {
         if line.contains("Tunnel is up and running") || line.contains("Configured as ") {
             if let Status::Connecting(id) = &self.status {
                 let id = id.clone();
+                // A typed password just proved right; keep it if asked to.
+                if let (Some(login), Some(vpn)) = (self.password_login.take(), self.vpn(&id)) {
+                    if login.typed && vpn.save_login {
+                        vpn.save_password(&login.password);
+                    }
+                }
                 notify("VPN connected", &self.vpn_name(&id));
                 self.status = Status::Connected(id);
                 self.refresh();
@@ -565,6 +640,10 @@ impl App {
         }
         if line.contains("a password is required") || line.contains("a terminal is required") {
             self.sudo_failed = true;
+        }
+        // openfortivpn / openconnect when the gateway refuses the credentials.
+        if line.contains("Could not authenticate to gateway") || line.contains("Invalid credentials") {
+            self.auth_failed = true;
         }
         // Both tools print the flag to add when the gateway certificate isn't
         // trusted: openfortivpn --trusted-cert <hex>, openconnect --servercert <pin>.
@@ -588,6 +667,8 @@ impl App {
         let tunnel = self.tunnel.take().unwrap();
         let name = self.vpn_name(&tunnel.vpn_id);
         let prev = std::mem::replace(&mut self.status, Status::Idle);
+        let password_login = self.password_login.take();
+        let password_vpn = self.vpn(&tunnel.vpn_id).filter(|v| !v.sso).cloned();
 
         if let Some(digest) = self.pending_cert.take() {
             let msg = format!(
@@ -598,8 +679,13 @@ impl App {
                     v.trusted_cert = digest;
                 }
                 config::save(&self.vpns);
-                return self.start_auth(target, &tunnel.vpn_id);
+                return self.start_auth_with(target, &tunnel.vpn_id, password_login);
             }
+        } else if let (true, Status::Connecting(_), Some(vpn)) = (self.auth_failed, &prev, &password_vpn) {
+            // Wrong password: drop any saved one and ask again.
+            vpn.forget_password();
+            self.status = Status::SigningIn(vpn.id.clone());
+            self.open_login(target, vpn, "The gateway rejected the username or password.");
         } else {
             match prev {
                 Status::Disconnecting(_) => match self.next_vpn.take() {
@@ -641,7 +727,7 @@ impl App {
         let title = if vpn.is_some() { "Edit VPN Connection" } else { "New VPN Connection" };
         let window = WindowBuilder::new()
             .with_title(title)
-            .with_inner_size(LogicalSize::new(640.0, 520.0))
+            .with_inner_size(LogicalSize::new(640.0, 620.0))
             .with_resizable(false)
             .build(target)
             .expect("create form window");
@@ -694,6 +780,16 @@ impl App {
             return show_error("Trusted cert must be a 64-character SHA-256 hex digest.");
         }
 
+        let sso = msg["sso"].as_bool().unwrap_or(true);
+        let save_login = msg["save_login"].as_bool().unwrap_or(false);
+        let username = s("username");
+        if !sso && save_login && username.is_empty() {
+            return show_error("Enter a username, or choose Prompt on login.");
+        }
+        if !username.is_empty() && !config::valid_username(&username) {
+            return show_error("The username must be at most 64 characters.");
+        }
+
         let vpn = Vpn {
             id: msg["id"].as_str().map(String::from).unwrap_or_else(config::new_id),
             name,
@@ -701,13 +797,90 @@ impl App {
             host,
             port,
             trusted_cert,
+            sso,
+            username,
+            save_login,
         };
         match self.vpns.iter_mut().find(|v| v.id == vpn.id) {
-            Some(existing) => *existing = vpn,
+            Some(existing) => {
+                // A saved password belongs to the old account / setting.
+                if vpn.sso || !vpn.save_login || existing.username != vpn.username || existing.host != vpn.host {
+                    existing.forget_password();
+                }
+                *existing = vpn;
+            }
             None => self.vpns.push(vpn),
         }
         config::save(&self.vpns);
         self.form = None;
+        self.refresh();
+    }
+}
+
+impl App {
+    // ---- password prompt ------------------------------------------------
+
+    fn open_login(&mut self, target: &Target, vpn: &Vpn, error: &str) {
+        self.login = None;
+        let window = WindowBuilder::new()
+            .with_title(format!("Connect – {}", vpn.name))
+            .with_inner_size(LogicalSize::new(440.0, 280.0))
+            .with_resizable(false)
+            .build(target)
+            .expect("create login window");
+        center(&window);
+
+        let init = format!(
+            "window.__LOGIN = {};",
+            serde_json::json!({ "name": vpn.name, "username": vpn.username, "save": vpn.save_login, "error": error })
+        );
+        let proxy = self.proxy.clone();
+        let webview = WebViewBuilder::new()
+            .with_initialization_script(&init)
+            .with_html(include_str!("login.html"))
+            .with_ipc_handler(move |req| {
+                let _ = proxy.send_event(UserEvent::Login(req.body().clone()));
+            })
+            .build(&window)
+            .expect("create login webview");
+        window.set_focus();
+        self.login = Some((vpn.id.clone(), window, webview));
+    }
+
+    fn on_login(&mut self, body: String) {
+        let Ok(msg) = serde_json::from_str::<serde_json::Value>(&body) else { return };
+        if msg["action"].as_str() != Some("connect") {
+            return self.cancel_login();
+        }
+        let Some((id, _, webview)) = &self.login else { return };
+        let id = id.clone();
+        let show_error = |text: &str| {
+            let _ = webview.evaluate_script(&format!("showError({})", serde_json::to_string(text).unwrap()));
+        };
+        let username = msg["username"].as_str().unwrap_or("").trim().to_string();
+        let password = msg["password"].as_str().unwrap_or("").to_string();
+        if !config::valid_username(&username) {
+            return show_error("Enter a username (at most 64 characters).");
+        }
+        if !config::valid_password(&password) {
+            return show_error("Enter a password (at most 256 characters).");
+        }
+        if !matches!(&self.status, Status::SigningIn(s) if *s == id) {
+            self.login = None;
+            return;
+        }
+        self.login = None;
+
+        // Remember a changed username; a password saved for the old one is stale.
+        let Some(vpn) = self.vpns.iter_mut().find(|v| v.id == id) else { return };
+        if vpn.username != username {
+            vpn.forget_password();
+            vpn.username = username.clone();
+            config::save(&self.vpns);
+        }
+        let vpn = self.vpn(&id).cloned().unwrap();
+        let auth = Auth::Password { username: username.clone(), password: password.clone() };
+        self.start_tunnel(&vpn, auth, Some(PasswordLogin { username, password, typed: true }));
         self.refresh();
     }
 }

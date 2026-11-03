@@ -1,10 +1,13 @@
 #!/bin/bash
-# Root helper for FortiBar. Runs openfortivpn with a SAML session cookie read
-# from stdin and wires the VPN's DNS servers into macOS (scutil), which
-# openfortivpn itself cannot do (it only knows /etc/resolv.conf).
+# Root helper for FortiBar. Runs openfortivpn with a SAML session cookie or a
+# username and password read from stdin, and wires the VPN's DNS servers into
+# macOS (scutil), which openfortivpn itself cannot do (it only knows
+# /etc/resolv.conf).
 #
 # usage: sudo fortivpn-helper <host:port> [trusted-cert-sha256]
 #   stdin: SVPNCOOKIE=<value>
+#      or: USER=<username>
+#          <password>
 #
 # setup.sh installs this root-owned next to the openfortivpn binary and adds a
 # sudoers rule for exactly this path.
@@ -28,10 +31,27 @@ if [[ -n "$CERT" ]] && ! [[ "$CERT" =~ ^[0-9A-Fa-f]{64}$ ]]; then
 	exit 2
 fi
 
-IFS= read -r COOKIE
-if ! [[ "$COOKIE" =~ ^(SVPNCOOKIE=)?[A-Za-z0-9%+/=._-]+$ ]]; then
-	echo "ERROR: invalid cookie on stdin" >&2
-	exit 2
+IFS= read -r FIRST
+if [[ "$FIRST" == USER=* ]]; then
+	VPN_USER="${FIRST#USER=}"
+	IFS= read -r SECRET || true
+	if ! [[ "$VPN_USER" =~ ^[[:print:]]{1,64}$ ]]; then
+		echo "ERROR: invalid username on stdin" >&2
+		exit 2
+	fi
+	if [[ -z "$SECRET" || ${#SECRET} -gt 256 ]]; then
+		echo "ERROR: invalid password on stdin" >&2
+		exit 2
+	fi
+	# openfortivpn reads the password from stdin when none is configured.
+	ARGS=("$GW" "--username=$VPN_USER")
+else
+	SECRET="$FIRST"
+	if ! [[ "$SECRET" =~ ^(SVPNCOOKIE=)?[A-Za-z0-9%+/=._-]+$ ]]; then
+		echo "ERROR: invalid cookie on stdin" >&2
+		exit 2
+	fi
+	ARGS=("$GW" --cookie-on-stdin)
 fi
 
 WORK="$(mktemp -d /tmp/fortibar.XXXXXX)"
@@ -109,10 +129,10 @@ clear_dns() {
 	killall -HUP mDNSResponder 2>/dev/null
 }
 
-ARGS=("$GW" --cookie-on-stdin --set-dns=0 --pppd-use-peerdns=0)
+ARGS+=(--set-dns=0 --pppd-use-peerdns=0)
 [[ -n "$CERT" ]] && ARGS+=(--trusted-cert "$CERT")
 
-printf '%s\n' "$COOKIE" | "$OFV" "${ARGS[@]}" >"$FIFO" 2>&1 &
+printf '%s\n' "$SECRET" | "$OFV" "${ARGS[@]}" >"$FIFO" 2>&1 &
 OFV_PID=$!
 
 (
