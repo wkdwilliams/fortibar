@@ -34,8 +34,11 @@ pub enum Auth {
 fn command(vpn: &Vpn, _auth: &Auth) -> Command {
     let mut cmd = Command::new("/usr/bin/sudo");
     cmd.arg("-n").arg(tunnel_program()).arg(vpn.host_port());
-    if !vpn.trusted_cert.is_empty() {
+    if !vpn.trusted_cert.is_empty() || !vpn.dns_domains.is_empty() {
         cmd.arg(&vpn.trusted_cert);
+    }
+    if !vpn.dns_domains.is_empty() {
+        cmd.arg(vpn.dns_domains.join(","));
     }
     cmd
 }

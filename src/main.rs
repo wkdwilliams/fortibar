@@ -727,7 +727,7 @@ impl App {
         let title = if vpn.is_some() { "Edit VPN Connection" } else { "New VPN Connection" };
         let window = WindowBuilder::new()
             .with_title(title)
-            .with_inner_size(LogicalSize::new(640.0, 620.0))
+            .with_inner_size(LogicalSize::new(640.0, 690.0))
             .with_resizable(false)
             .build(target)
             .expect("create form window");
@@ -790,6 +790,10 @@ impl App {
             return show_error("The username must be at most 64 characters.");
         }
 
+        let Some(dns_domains) = config::parse_dns_domains(&s("dns_domains")) else {
+            return show_error("DNS domains must be domain names like corp.example.com, separated by commas (at most 16).");
+        };
+
         let vpn = Vpn {
             id: msg["id"].as_str().map(String::from).unwrap_or_else(config::new_id),
             name,
@@ -800,6 +804,7 @@ impl App {
             sso,
             username,
             save_login,
+            dns_domains,
         };
         match self.vpns.iter_mut().find(|v| v.id == vpn.id) {
             Some(existing) => {

@@ -108,6 +108,11 @@ pub struct Vpn {
     /// successful connect, instead of asking every time.
     #[serde(default)]
     pub save_login: bool,
+    /// macOS: names under these domains are resolved by the VPN's DNS
+    /// servers, on top of any domains the gateway pushes. With none at all,
+    /// the VPN's DNS servers aren't used.
+    #[serde(default)]
+    pub dns_domains: Vec<String>,
 }
 
 fn yes() -> bool {
@@ -171,6 +176,25 @@ impl Vpn {
 
 /// openfortivpn's limits; no control characters since each goes on one line
 /// of the tunnel's stdin.
+/// "corp.example.com, example.net" -> ["corp.example.com", "example.net"].
+/// None if any entry isn't a plain domain name.
+pub fn parse_dns_domains(input: &str) -> Option<Vec<String>> {
+    let mut out: Vec<String> = Vec::new();
+    for d in input.split(|c: char| c == ',' || c.is_whitespace()).filter(|d| !d.is_empty()) {
+        let d = d.trim_matches('.').to_ascii_lowercase();
+        let valid = !d.is_empty()
+            && d.len() <= 253
+            && d.split('.').all(|l| !l.is_empty() && l.chars().all(|c| c.is_ascii_alphanumeric() || c == '-'));
+        if !valid {
+            return None;
+        }
+        if !out.contains(&d) {
+            out.push(d);
+        }
+    }
+    (out.len() <= 16).then_some(out)
+}
+
 pub fn valid_username(s: &str) -> bool {
     !s.is_empty() && s.len() <= 64 && !s.chars().any(char::is_control)
 }
@@ -266,6 +290,20 @@ mod tests {
         let v: Vpn = serde_json::from_str(r#"{"id":"ab","name":"n","host":"h","port":443}"#).unwrap();
         assert!(v.sso);
         assert!(v.username.is_empty());
+        assert!(v.dns_domains.is_empty());
+    }
+
+    #[test]
+    fn dns_domains() {
+        assert_eq!(parse_dns_domains(""), Some(vec![]));
+        assert_eq!(
+            parse_dns_domains(" Intranet.Example.org, .corp.example.net  corp.example.net,"),
+            Some(vec!["intranet.example.org".to_string(), "corp.example.net".to_string()])
+        );
+        assert_eq!(parse_dns_domains("a..b"), None);
+        assert_eq!(parse_dns_domains("bad_domain.com"), None);
+        assert_eq!(parse_dns_domains("x.com;rm -rf"), None);
+        assert_eq!(parse_dns_domains(&(0..17).map(|i| format!("d{i}.com")).collect::<Vec<_>>().join(",")), None);
     }
 
     #[cfg(target_os = "macos")]
@@ -281,6 +319,7 @@ mod tests {
             sso: true,
             username: String::new(),
             save_login: false,
+            dns_domains: Vec::new(),
         };
         let b = Vpn { id: new_id(), ..a.clone() };
         assert_eq!(a.id.len(), 32);

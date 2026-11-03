@@ -106,13 +106,23 @@ For SSO VPNs:
    If it hasn't finished after 4 seconds, the window is shown.
 2. The FortiGate `SVPNCOOKIE` is read from the profile. If the gateway redirects to `127.0.0.1:8020/?id=…`, the app exchanges the id for the cookie first.
 3. The cookie is passed over stdin to the tunnel:
-   - **macOS:** `sudo fortivpn-helper` runs `openfortivpn --cookie-on-stdin`, then sets DNS with `scutil`.
-     Domains the gateway pushes use split DNS. If it pushes none, all lookups go through the VPN. DNS is restored on disconnect.
+   - **macOS:** `sudo fortivpn-helper` runs `openfortivpn --cookie-on-stdin`, then sets up split DNS with `scutil`:
+     names under the domains the gateway pushes, plus the VPN's **DNS Domains** setting, go to the VPN's
+     DNS servers (only those routed through the tunnel). Everything else uses your normal DNS. It's removed on disconnect.
    - **Windows:** `openconnect --protocol=fortinet --cookie-on-stdin` with wintun. Its vpnc script sets routes and DNS.
 
 For password VPNs there's no browser step. The username and password go over stdin
 (never the command line) to `openfortivpn --username` on macOS, or `openconnect --user --passwd-on-stdin`
 on Windows. Tunnel setup and DNS work the same as above.
+
+### Internal names don't resolve (macOS)
+
+Some gateways send DNS servers but no DNS domains. FortiBar then can't tell which names belong
+to the VPN, and leaves your DNS alone. Show Log says so. Edit the VPN and list its domains under
+**DNS Domains**, e.g. `intranet.example.org`.
+
+FortiBar doesn't send all lookups through the VPN instead. macOS would tie those servers to Wi-Fi,
+so queries leave from the Wi-Fi address, and the VPN's DNS servers don't answer those.
 
 ### Gateways with untrusted certificates
 
