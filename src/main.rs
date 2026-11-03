@@ -549,7 +549,7 @@ impl App {
         if !config::tunnel_program().exists() {
             self.status = Status::Idle;
             #[cfg(target_os = "macos")]
-            alert("FortiBar isn't set up yet", "Run ./setup.sh in the FortiBar folder once, then try again.");
+            alert("FortiBar isn't set up yet", "Run ./setup.sh in the FortiBar project folder once, then try again.");
             #[cfg(windows)]
             alert(
                 "openconnect is missing",
@@ -695,7 +695,7 @@ impl App {
                 Status::Connected(_) => notify("VPN connection dropped", &name),
                 _ if self.sudo_failed => alert(
                     "FortiBar needs setup",
-                    "sudo asked for a password. Run ./setup.sh in the FortiBar folder to install the helper rule.",
+                    "sudo asked for a password. Run ./setup.sh in the FortiBar project folder to install the helper rule.",
                 ),
                 _ => {
                     let errors: Vec<&str> = self

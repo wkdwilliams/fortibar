@@ -1,6 +1,7 @@
 #!/bin/bash
-# One-time setup for FortiBar. Everything lands inside this folder except the
-# sudoers rule (/etc/sudoers.d/fortibar), which lets the app start the VPN
+# One-time setup for FortiBar. Builds openfortivpn and the app inside this
+# folder, then installs the root-owned helper into /usr/local/libexec/fortibar
+# plus a sudoers rule (/etc/sudoers.d/fortibar) so the app can start the VPN
 # without asking for your password each time.
 #
 #   ./setup.sh          build openfortivpn + the app, install sudoers rule
@@ -9,7 +10,7 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")" && pwd)"
 VENDOR="$ROOT/vendor"
-BIN="$VENDOR/bin"
+BIN=/usr/local/libexec/fortibar
 export CARGO_HOME="$ROOT/.cargo"   # crate downloads stay in this folder
 export CARGO_TARGET_DIR="$ROOT/target"
 
@@ -41,6 +42,8 @@ build_openfortivpn() {
 install_helper() {
 	echo "Installing root-owned helper into $BIN (needs your password)…"
 	sudo mkdir -p "$BIN"
+	# Older versions installed it inside the project folder.
+	sudo rm -rf "$VENDOR/bin"
 	sudo install -o root -g wheel -m 755 "$VENDOR/openfortivpn/bin/openfortivpn" "$BIN/openfortivpn"
 	sudo install -o root -g wheel -m 755 "$ROOT/scripts/fortivpn-helper.sh" "$BIN/fortivpn-helper"
 	sudo chown root:wheel "$BIN"
