@@ -96,4 +96,6 @@ fi
 install_helper
 build_app
 echo
-echo "Done. Start it with: open \"$ROOT/dist/FortiBar.app\""
+if [[ -z "${MAKELEVEL:-}" ]]; then
+	echo "Done. Start it with: open \"$ROOT/dist/FortiBar.app\""
+fi

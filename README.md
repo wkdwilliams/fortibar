@@ -25,9 +25,12 @@ Then:
 ```sh
 git clone https://github.com/wkdwilliams/fortibar.git
 cd fortibar
-./setup.sh
-open dist/FortiBar.app
+make
 ```
+
+`make` runs `./setup.sh`, then asks whether to move the app into `/Applications`, `~/Applications`,
+or leave it in `dist/`. To skip the question, pass `DEST`, e.g. `make DEST=~/Applications` or
+`make DEST=none`. Quit FortiBar before running `make`, since it replaces the app.
 
 `setup.sh` asks for your password once, for the steps that need root. It:
 - clones and builds [openfortivpn](https://github.com/adrienverge/openfortivpn) into `vendor/` (skipped if it's already built)
@@ -35,20 +38,19 @@ open dist/FortiBar.app
   `/etc/sudoers.d/fortibar` so the app can start the tunnel without a password prompt
 - builds the app into `dist/FortiBar.app` (crates download into `.cargo/`, build output into `target/`)
 
-The app doesn't depend on the project folder, so you can copy `dist/FortiBar.app` to `/Applications`.
-Copy it again after rebuilding.
+The app doesn't depend on the project folder, so it runs from wherever you put it.
 
-After changing only the Rust code, `./setup.sh --app` rebuilds just the app.
+After changing only the Rust code, `make app` rebuilds just the app and asks again where it goes.
 
 To start it at login, tick **Start at Login** in the FortiBar menu.
 
-Run `./setup.sh` again after changing `scripts/fortivpn-helper.sh`. The app runs the root-owned
+Run `make` again after changing `scripts/fortivpn-helper.sh`. The app runs the root-owned
 copy in `/usr/local/libexec/fortibar/`, not the script in the project.
 
 ### Uninstall
 
 ```sh
-./uninstall.sh   # removes the sudoers rule, root-owned helper, saved VPNs, WebKit profiles and saved passwords
+make uninstall   # removes the sudoers rule, root-owned helper, installed app, saved VPNs, WebKit profiles and saved passwords
 ```
 
 Then delete the project folder.
