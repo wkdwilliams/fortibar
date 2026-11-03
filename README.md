@@ -144,5 +144,6 @@ Data lives in `~/Library/Application Support/FortiBar/` on macOS, and in `data\`
 | `/usr/local/libexec/fortibar/` | root-owned helper and openfortivpn (macOS) |
 | `vendor/` | openfortivpn source and build (macOS) |
 | `.cargo/`, `target/`, `dist/` | Rust crates, build output, packaged app |
+| `assets/AppIcon.svg`, `assets/AppIcon.icns` | app icon (macOS). After editing the SVG, run `scripts/make-icon.sh` |
 
 Older macOS builds kept data in the project's `data/` folder; it moves to Application Support the first time the app starts.
