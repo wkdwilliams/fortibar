@@ -1,10 +1,14 @@
 # FortiBar
 
-A small menu bar / system tray client for FortiGate SSL-VPN with Microsoft SSO (SAML).
+A small menu bar / system tray client for FortiGate SSL-VPN, with Microsoft SSO (SAML)
+or a plain username and password.
 
 Every VPN you add gets its own isolated browser profile, so each one remembers
 its own Microsoft login. That holds even when several VPNs share one gateway
 with different accounts. Switching VPNs normally needs no email, password or OTP.
+
+VPNs without SSO log in with a username and password instead. Each VPN keeps its own,
+so several accounts work side by side, even on the same gateway.
 
 ## macOS
 
@@ -23,10 +27,13 @@ open dist/FortiBar.app
 
 To start it at login: System Settings → General → Login Items → add `dist/FortiBar.app`.
 
+Run `./setup.sh` again after moving the project folder or changing `scripts/fortivpn-helper.sh`.
+The app runs the root-owned copy in `vendor/bin/`, and the sudoers rule names its absolute path.
+
 ### Uninstall
 
 ```sh
-./uninstall.sh   # removes the sudoers rule, root-owned helper and WebKit profiles
+./uninstall.sh   # removes the sudoers rule, root-owned helper, WebKit profiles and saved passwords
 cd .. && rm -rf forti-clone
 ```
 
@@ -66,10 +73,16 @@ This builds OpenConnect 9.21 from its release tarball and bundles it with wintun
 - **Click the connected VPN** again to disconnect.
 - On the first sign-in a window opens for the Microsoft login. Choose **Stay signed in** if you're asked.
   After that, sign-in usually finishes in the background and the window never appears.
-- **Forget Saved Login** clears one VPN's browser profile.
+- For a VPN with SSO turned off, a window asks for the username and password. With **Save login**
+  the password is kept in the macOS Keychain (Windows: Credential Manager) after the first
+  successful connect, so later connects don't ask. With **Prompt on login** it asks every time.
+  If the gateway rejects a saved password, it is deleted and you're asked again.
+- **Forget Saved Login** clears one VPN's browser profile, or its saved password.
 - **Show Log** opens the last tunnel output.
 
 ## How it works
+
+For SSO VPNs:
 
 1. A hidden browser window (one isolated profile per VPN: WebKit on macOS, WebView2 on Windows) opens
    `https://<gateway>/remote/saml/start?redirect=1`. If Microsoft still has a valid session, the SAML flow completes on its own.
@@ -79,6 +92,10 @@ This builds OpenConnect 9.21 from its release tarball and bundles it with wintun
    - **macOS:** `sudo fortivpn-helper` runs `openfortivpn --cookie-on-stdin`, then sets DNS with `scutil`.
      Domains the gateway pushes use split DNS. If it pushes none, all lookups go through the VPN. DNS is restored on disconnect.
    - **Windows:** `openconnect --protocol=fortinet --cookie-on-stdin` with wintun. Its vpnc script sets routes and DNS.
+
+For password VPNs there's no browser step. The username and password go over stdin
+(never the command line) to `openfortivpn --username` on macOS, or `openconnect --user --passwd-on-stdin`
+on Windows. Tunnel setup and DNS work the same as above.
 
 ### Gateways with untrusted certificates
 
@@ -92,6 +109,7 @@ reached by IP address. On Windows the sign-in window doesn't do this yet.
 |---|---|
 | `data/vpns.json` | your VPN list |
 | `data/<id>.cookies` | Microsoft session cookies, so logins survive app restarts |
+| Keychain / Credential Manager, service `FortiBar`, account `<id>` | saved passwords for password VPNs |
 | `data/profiles/` | per-VPN WebView2 profiles (Windows) |
 | `vendor/` | openfortivpn source, build, and the root-owned helper (macOS) |
 | `.cargo/`, `target/`, `dist/` | Rust crates, build output, packaged app |

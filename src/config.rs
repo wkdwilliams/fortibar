@@ -62,6 +62,20 @@ pub struct Vpn {
     /// certificate doesn't validate against the system CAs.
     #[serde(default)]
     pub trusted_cert: String,
+    /// true: Microsoft SSO (SAML) in a browser profile. false: username and
+    /// password, handed straight to the tunnel program.
+    #[serde(default = "yes")]
+    pub sso: bool,
+    #[serde(default)]
+    pub username: String,
+    /// Keep the password in the Keychain / Credential Manager after the first
+    /// successful connect, instead of asking every time.
+    #[serde(default)]
+    pub save_login: bool,
+}
+
+fn yes() -> bool {
+    true
 }
 
 impl Vpn {
@@ -97,6 +111,36 @@ impl Vpn {
     pub fn cookie_file(&self) -> PathBuf {
         data_dir().join(format!("{}.cookies", self.id))
     }
+
+    fn keyring_entry(&self) -> Option<keyring::Entry> {
+        keyring::Entry::new("FortiBar", &self.id).ok()
+    }
+
+    pub fn saved_password(&self) -> Option<String> {
+        self.keyring_entry()?.get_password().ok().filter(|p| valid_password(p))
+    }
+
+    pub fn save_password(&self, password: &str) {
+        if let Some(e) = self.keyring_entry() {
+            let _ = e.set_password(password);
+        }
+    }
+
+    pub fn forget_password(&self) {
+        if let Some(e) = self.keyring_entry() {
+            let _ = e.delete_credential();
+        }
+    }
+}
+
+/// openfortivpn's limits; no control characters since each goes on one line
+/// of the tunnel's stdin.
+pub fn valid_username(s: &str) -> bool {
+    !s.is_empty() && s.len() <= 64 && !s.chars().any(char::is_control)
+}
+
+pub fn valid_password(s: &str) -> bool {
+    !s.is_empty() && s.len() <= 256 && !s.chars().any(|c| c == '\n' || c == '\r' || c == '\0')
 }
 
 pub fn new_id() -> String {
@@ -169,10 +213,39 @@ mod tests {
         assert!(!valid_cert("zz"));
     }
 
+    #[test]
+    fn validates_credentials() {
+        assert!(valid_username("Agnos$parin"));
+        assert!(valid_username("dom\\user"));
+        assert!(!valid_username(""));
+        assert!(!valid_username("a\nb"));
+        assert!(!valid_username(&"x".repeat(65)));
+        assert!(valid_password(" p@ss word\\$ "));
+        assert!(!valid_password(""));
+        assert!(!valid_password("a\nb"));
+    }
+
+    #[test]
+    fn old_configs_default_to_sso() {
+        let v: Vpn = serde_json::from_str(r#"{"id":"ab","name":"n","host":"h","port":443}"#).unwrap();
+        assert!(v.sso);
+        assert!(v.username.is_empty());
+    }
+
     #[cfg(target_os = "macos")]
     #[test]
     fn store_id_is_stable_and_distinct() {
-        let a = Vpn { id: new_id(), name: "a".into(), description: String::new(), host: "h".into(), port: 443, trusted_cert: String::new() };
+        let a = Vpn {
+            id: new_id(),
+            name: "a".into(),
+            description: String::new(),
+            host: "h".into(),
+            port: 443,
+            trusted_cert: String::new(),
+            sso: true,
+            username: String::new(),
+            save_login: false,
+        };
         let b = Vpn { id: new_id(), ..a.clone() };
         assert_eq!(a.id.len(), 32);
         assert_eq!(a.store_id(), a.store_id());

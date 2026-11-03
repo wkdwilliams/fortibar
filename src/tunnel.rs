@@ -22,8 +22,16 @@ pub struct Tunnel {
     exited: Arc<AtomicBool>,
 }
 
+/// How the tunnel logs in. Either way the secret goes over stdin so it never
+/// shows up in the process list.
+pub enum Auth {
+    /// FortiGate session cookie from SAML sign-in.
+    Cookie(String),
+    Password { username: String, password: String },
+}
+
 #[cfg(target_os = "macos")]
-fn command(vpn: &Vpn) -> Command {
+fn command(vpn: &Vpn, _auth: &Auth) -> Command {
     let mut cmd = Command::new("/usr/bin/sudo");
     cmd.arg("-n").arg(tunnel_program()).arg(vpn.host_port());
     if !vpn.trusted_cert.is_empty() {
@@ -33,13 +41,16 @@ fn command(vpn: &Vpn) -> Command {
 }
 
 #[cfg(windows)]
-fn command(vpn: &Vpn) -> Command {
+fn command(vpn: &Vpn, auth: &Auth) -> Command {
     use std::os::windows::process::CommandExt;
     let program = tunnel_program();
     let mut cmd = Command::new(&program);
-    cmd.arg("--protocol=fortinet")
-        .arg("--cookie-on-stdin")
-        .arg("--non-inter")
+    cmd.arg("--protocol=fortinet");
+    match auth {
+        Auth::Cookie(_) => cmd.arg("--cookie-on-stdin"),
+        Auth::Password { username, .. } => cmd.arg(format!("--user={username}")).arg("--passwd-on-stdin"),
+    };
+    cmd.arg("--non-inter")
         .arg("--script")
         .arg(program.with_file_name("vpnc-script-win.js"))
         .creation_flags(CREATE_NO_WINDOW);
@@ -57,19 +68,29 @@ fn command(vpn: &Vpn) -> Command {
 impl Tunnel {
     pub fn start(
         vpn: &Vpn,
-        cookie: &str,
+        auth: &Auth,
         session: u64,
         proxy: EventLoopProxy<UserEvent>,
     ) -> std::io::Result<Tunnel> {
-        let mut child = command(vpn)
+        let mut child = command(vpn, auth)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()?;
 
-        // The cookie goes over stdin so it never shows up in the process list.
         let mut stdin = child.stdin.take().unwrap();
-        writeln!(stdin, "SVPNCOOKIE={cookie}")?;
+        match auth {
+            Auth::Cookie(cookie) => writeln!(stdin, "SVPNCOOKIE={cookie}")?,
+            // The helper takes the username on the first line (macOS);
+            // openconnect gets it as --user and only wants the password.
+            Auth::Password { username, password } => {
+                #[cfg(target_os = "macos")]
+                writeln!(stdin, "USER={username}")?;
+                #[cfg(windows)]
+                let _ = username;
+                writeln!(stdin, "{password}")?;
+            }
+        }
         drop(stdin);
 
         forward_lines(child.stdout.take().unwrap(), session, proxy.clone());
