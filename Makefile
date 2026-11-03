@@ -29,7 +29,7 @@ uninstall:
 # setup.sh deletes and rebuilds the app bundle, and the move replaces the
 # installed one, so neither should be running.
 not-running:
-	@if pgrep -qf 'FortiBar.app/Contents/MacOS/FortiBar'; then \
+	@if pgrep -qx FortiBar; then \
 		echo "FortiBar is running. Disconnect, quit it, then run make again." >&2; \
 		exit 1; \
 	fi
