@@ -9,8 +9,8 @@
 #      or: USER=<username>
 #          <password>
 #
-# setup.sh installs this root-owned next to the openfortivpn binary and adds a
-# sudoers rule for exactly this path.
+# setup.sh installs this root-owned next to the openfortivpn binary in
+# /usr/local/libexec/fortibar and adds a sudoers rule for exactly this path.
 
 set -u
 PATH=/usr/bin:/bin:/usr/sbin:/sbin
@@ -156,7 +156,9 @@ clear_dns() {
 	killall -HUP mDNSResponder 2>/dev/null
 }
 
-ARGS+=(--set-dns=0 --pppd-use-peerdns=0)
+# Everything comes from the command line; an empty --config stops openfortivpn
+# looking for a config file under the sysconfdir it was built with.
+ARGS+=(--config= --set-dns=0 --pppd-use-peerdns=0)
 [[ -n "$CERT" ]] && ARGS+=(--trusted-cert "$CERT")
 
 printf '%s\n' "$SECRET" | "$OFV" "${ARGS[@]}" >"$FIFO" 2>&1 &

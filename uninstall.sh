@@ -1,11 +1,16 @@
 #!/bin/bash
-# Removes the system-level bits setup.sh created (sudoers rule + root-owned
-# helper dir). After this, the whole folder can be deleted normally.
+# Removes what setup.sh and the app put outside this folder: the sudoers rule,
+# the root-owned helper, saved VPNs, logins and passwords. After this, the
+# whole folder can be deleted normally.
 set -u
 ROOT="$(cd "$(dirname "$0")" && pwd)"
-pkill -f "$ROOT/dist/FortiBar.app" 2>/dev/null
+pkill -f 'FortiBar.app/Contents/MacOS/FortiBar' 2>/dev/null
 sudo rm -f /etc/sudoers.d/fortibar
-sudo rm -rf "$ROOT/vendor/bin"
+sudo rm -rf /usr/local/libexec/fortibar "$ROOT/vendor/bin"
+# VPN list, Microsoft session cookies and log.
+rm -rf "$HOME/Library/Application Support/FortiBar" "$ROOT/data"
+# Start at Login item.
+rm -f "$HOME/Library/LaunchAgents/local.fortibar.plist"
 # Per-VPN browser profiles (Microsoft login cookies) kept by WebKit.
 rm -rf "$HOME/Library/WebKit/local.fortibar" "$HOME/Library/WebKit/fortibar" \
 	"$HOME/Library/Caches/local.fortibar" "$HOME/Library/Caches/fortibar"

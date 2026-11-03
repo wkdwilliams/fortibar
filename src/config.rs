@@ -4,9 +4,9 @@ use std::hash::{BuildHasher, Hasher};
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-/// Where data/ and the tunnel program live. On macOS that's the project
-/// folder (setup.sh builds in place); on Windows it's the folder FortiBar.exe
-/// was unzipped into.
+/// Windows: the folder FortiBar.exe was unzipped into, which holds data\ and
+/// openconnect\. macOS: the project folder, where data/ lived before it moved
+/// to Application Support (only read to migrate it).
 pub fn app_dir() -> PathBuf {
     let exe = std::env::current_exe().ok();
     #[cfg(windows)]
@@ -23,7 +23,19 @@ pub fn app_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
 }
 
+/// macOS: ~/Library/Application Support/FortiBar, so the app works from
+/// anywhere (e.g. /Applications). Windows: data\ next to FortiBar.exe.
 pub fn data_dir() -> PathBuf {
+    #[cfg(target_os = "macos")]
+    let dir = {
+        let home = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_default();
+        let dir = home.join("Library/Application Support/FortiBar");
+        if !dir.exists() {
+            migrate_data(&app_dir().join("data"), &dir);
+        }
+        dir
+    };
+    #[cfg(not(target_os = "macos"))]
     let dir = app_dir().join("data");
     let _ = std::fs::create_dir_all(&dir);
     // Holds saved login cookies; keep it private to this user.
@@ -32,10 +44,34 @@ pub fn data_dir() -> PathBuf {
     dir
 }
 
-/// macOS: root helper wrapping openfortivpn. Windows: bundled openconnect.
+/// Moves data/ from the project folder, where older builds kept it.
+#[cfg(target_os = "macos")]
+fn migrate_data(old: &std::path::Path, new: &std::path::Path) {
+    if !old.join("vpns.json").is_file() {
+        return;
+    }
+    if let Some(parent) = new.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    if std::fs::rename(old, new).is_ok() {
+        return;
+    }
+    // Different volume: copy the files (data/ is flat on macOS) instead.
+    let _ = std::fs::create_dir_all(new);
+    if let Ok(entries) = std::fs::read_dir(old) {
+        for e in entries.flatten() {
+            if e.path().is_file() {
+                let _ = std::fs::copy(e.path(), new.join(e.file_name()));
+            }
+        }
+    }
+}
+
+/// macOS: root helper wrapping openfortivpn, installed by setup.sh.
+/// Windows: bundled openconnect.
 pub fn tunnel_program() -> PathBuf {
     #[cfg(target_os = "macos")]
-    return app_dir().join("vendor/bin/fortivpn-helper");
+    return PathBuf::from("/usr/local/libexec/fortibar/fortivpn-helper");
     #[cfg(windows)]
     return app_dir().join("openconnect").join("openconnect.exe");
 }
