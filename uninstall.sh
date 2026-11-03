@@ -9,6 +9,13 @@ sudo rm -f /etc/sudoers.d/fortibar
 sudo rm -rf /usr/local/libexec/fortibar "$ROOT/vendor/bin"
 # VPN list, Microsoft session cookies and log.
 rm -rf "$HOME/Library/Application Support/FortiBar" "$ROOT/data"
+# Installed app bundles (only if they really are FortiBar).
+for app in /Applications/FortiBar.app "$HOME/Applications/FortiBar.app"; do
+	id="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$app/Contents/Info.plist" 2>/dev/null)"
+	if [[ "$id" == local.fortibar ]]; then
+		rm -rf "$app" 2>/dev/null || sudo rm -rf "$app"
+	fi
+done
 # Start at Login item.
 rm -f "$HOME/Library/LaunchAgents/local.fortibar.plist"
 # Per-VPN browser profiles (Microsoft login cookies) kept by WebKit.
