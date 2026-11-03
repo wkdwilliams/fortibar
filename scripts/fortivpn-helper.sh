@@ -58,6 +58,30 @@ WORK="$(mktemp -d /tmp/fortibar.XXXXXX)"
 FIFO="$WORK/out"
 mkfifo "$FIFO"
 
+# Saves a dynamic-store key's dictionary (or "No such key") to a file.
+save_key() {
+	printf 'get %s\nd.show\n' "$1" | scutil >"$2" 2>&1
+}
+
+# Puts back a key saved by save_key, or removes it if it did not exist.
+restore_key() {
+	local key="$1" file="$2"
+	if grep -q 'No such key' "$file"; then
+		printf 'remove %s\n' "$key" | scutil
+	else
+		{
+			echo "d.init"
+			awk -F' : ' '
+				/^  [A-Za-z]+ : <array>/ {key=$1; gsub(/ /,"",key); vals=""; inarr=1; next}
+				inarr && /^  }/ {print "d.add " key " *" vals; inarr=0; next}
+				inarr {split($0, kv, " : "); vals = vals " " kv[2]; next}
+				/^  [A-Za-z]+ : / {k=$1; gsub(/ /,"",k); print "d.add " k " " $2}
+			' "$file"
+			echo "set $key"
+		} | scutil
+	fi
+}
+
 # Primary-service DNS override, used only when the gateway sends no DNS
 # suffix (so split DNS has nothing to match on).
 backup_primary_dns() {
@@ -65,7 +89,8 @@ backup_primary_dns() {
 	svc="$(printf 'show State:/Network/Global/IPv4\n' | scutil | awk '/PrimaryService/ {print $3}')"
 	[[ -z "$svc" ]] && return 1
 	echo "$svc" >"$WORK/primary"
-	printf 'get State:/Network/Service/%s/DNS\nd.show\n' "$svc" | scutil >"$WORK/primary.dns" 2>&1
+	save_key "State:/Network/Service/$svc/DNS" "$WORK/primary.dns"
+	save_key "Setup:/Network/Service/$svc/DNS" "$WORK/primary.setup.dns"
 	return 0
 }
 
@@ -93,11 +118,24 @@ set_dns() {
 		EOF
 		echo "DNS: split DNS for$domains via$servers"
 	elif backup_primary_dns; then
+		local svc
+		svc="$(cat "$WORK/primary")"
 		scutil <<-EOF
 			d.init
 			d.add ServerAddresses *$servers
-			set State:/Network/Service/$(cat "$WORK/primary")/DNS
+			set State:/Network/Service/$svc/DNS
 		EOF
+		# DNS servers typed into System Settings live under Setup: and win
+		# over State:, so override them too while connected. This only
+		# touches the dynamic store, not the saved network preferences.
+		if grep -q ServerAddresses "$WORK/primary.setup.dns"; then
+			touch "$WORK/primary.setup.overridden"
+			scutil <<-EOF
+				d.init
+				d.add ServerAddresses *$servers
+				set Setup:/Network/Service/$svc/DNS
+			EOF
+		fi
 		echo "DNS: all lookups via$servers"
 	fi
 	dscacheutil -flushcache 2>/dev/null
@@ -109,20 +147,9 @@ clear_dns() {
 	if [[ -f "$WORK/primary" ]]; then
 		local svc
 		svc="$(cat "$WORK/primary")"
-		if grep -q 'No such key' "$WORK/primary.dns"; then
-			printf 'remove State:/Network/Service/%s/DNS\n' "$svc" | scutil
-		else
-			# Re-apply the saved dictionary.
-			{
-				echo "d.init"
-				awk -F' : ' '
-					/^  [A-Za-z]+ : <array>/ {key=$1; gsub(/ /,"",key); vals=""; inarr=1; next}
-					inarr && /^  }/ {print "d.add " key " *" vals; inarr=0; next}
-					inarr {split($0, kv, " : "); vals = vals " " kv[2]; next}
-					/^  [A-Za-z]+ : / {k=$1; gsub(/ /,"",k); print "d.add " k " " $2}
-				' "$WORK/primary.dns"
-				echo "set State:/Network/Service/$svc/DNS"
-			} | scutil
+		restore_key "State:/Network/Service/$svc/DNS" "$WORK/primary.dns"
+		if [[ -f "$WORK/primary.setup.overridden" ]]; then
+			restore_key "Setup:/Network/Service/$svc/DNS" "$WORK/primary.setup.dns"
 		fi
 	fi
 	dscacheutil -flushcache 2>/dev/null
