@@ -5,6 +5,15 @@
 set -u
 ROOT="$(cd "$(dirname "$0")" && pwd)"
 pkill -f 'FortiBar.app/Contents/MacOS/FortiBar' 2>/dev/null
+# Bring down a tunnel that is still up (the helper stops when the app goes,
+# but older helpers didn't), then its split-DNS resolver.
+sudo pkill -TERM -f '/usr/local/libexec/fortibar/' 2>/dev/null
+for _ in 1 2 3 4 5 6 7 8 9 10 11 12; do
+	pgrep -f '/usr/local/libexec/fortibar/' >/dev/null || break
+	sleep 1
+done
+sudo pkill -KILL -f '/usr/local/libexec/fortibar/' 2>/dev/null
+printf 'remove State:/Network/Service/fortibar/DNS\n' | sudo scutil
 sudo rm -f /etc/sudoers.d/fortibar
 sudo rm -rf /usr/local/libexec/fortibar "$ROOT/vendor/bin"
 # VPN list, Microsoft session cookies and log.

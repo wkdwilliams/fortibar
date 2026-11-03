@@ -18,14 +18,15 @@ use std::collections::HashMap;
 use std::ffi::{c_char, c_void, CStr};
 use std::sync::Mutex;
 
-/// host -> lowercase hex SHA-256 of the gateway's leaf certificate.
+/// "host:port" -> lowercase hex SHA-256 of the gateway's leaf certificate.
+/// Keyed by port too, since VPNs on one host can use different certificates.
 static PINS: Mutex<Option<HashMap<String, String>>> = Mutex::new(None);
 
 pub fn set_pins(vpns: &[Vpn]) {
     let pins = vpns
         .iter()
         .filter(|v| !v.trusted_cert.is_empty())
-        .map(|v| (v.host.clone(), v.trusted_cert.to_ascii_lowercase()))
+        .map(|v| (v.host_port().to_ascii_lowercase(), v.trusted_cert.to_ascii_lowercase()))
         .collect();
     *PINS.lock().unwrap() = Some(pins);
 }
@@ -96,7 +97,10 @@ unsafe extern "C-unwind" fn did_receive_challenge(
     let method = ns_string(msg_send![space, authenticationMethod]);
     if method == "NSURLAuthenticationMethodServerTrust" {
         let host = ns_string(msg_send![space, host]).to_ascii_lowercase();
-        let pinned = PINS.lock().unwrap().as_ref().and_then(|p| p.get(&host).cloned());
+        let port: isize = msg_send![space, port];
+        let port = if port > 0 { port } else { 443 };
+        let key = format!("{host}:{port}");
+        let pinned = PINS.lock().unwrap().as_ref().and_then(|p| p.get(&key).cloned());
         let trust: *const SecTrust = msg_send![space, serverTrust];
         if let (Some(pinned), false) = (pinned, trust.is_null()) {
             if leaf_sha256(trust).as_deref() == Some(pinned.as_str()) {

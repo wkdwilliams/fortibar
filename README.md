@@ -33,10 +33,16 @@ or leave it in `dist/`. To skip the question, pass `DEST`, e.g. `make DEST=~/App
 `make DEST=none`. Quit FortiBar before running `make`, since it replaces the app.
 
 `setup.sh` asks for your password once, for the steps that need root. It:
-- clones and builds [openfortivpn](https://github.com/adrienverge/openfortivpn) into `vendor/` (skipped if it's already built)
+- clones and builds [openfortivpn](https://github.com/adrienverge/openfortivpn) into `vendor/`, at the commit pinned in
+  `setup.sh` (skipped if that commit is already built)
 - installs `fortivpn-helper` + `openfortivpn` root-owned into `/usr/local/libexec/fortibar/` and adds
   `/etc/sudoers.d/fortibar` so the app can start the tunnel without a password prompt
 - builds the app into `dist/FortiBar.app` (crates download into `.cargo/`, build output into `target/`)
+
+The sudoers rule lets any program running as you start the helper without a password, and the helper
+connects to whatever gateway it's given and applies the routes and DNS that gateway pushes. So malware
+running as your user could redirect your traffic through a VPN of its choosing, without a password
+prompt. Don't run `setup.sh` on a machine where that trade-off isn't acceptable.
 
 The app doesn't depend on the project folder, so it runs from wherever you put it.
 
@@ -109,6 +115,7 @@ For SSO VPNs:
    - **macOS:** `sudo fortivpn-helper` runs `openfortivpn --cookie-on-stdin`, then sets up split DNS with `scutil`:
      names under the domains the gateway pushes, plus the VPN's **DNS Domains** setting, go to the VPN's
      DNS servers (only those routed through the tunnel). Everything else uses your normal DNS. It's removed on disconnect.
+     The tunnel also goes down if FortiBar quits or crashes, so it never stays up with nothing showing it.
    - **Windows:** `openconnect --protocol=fortinet --cookie-on-stdin` with wintun. Its vpnc script sets routes and DNS.
 
 For password VPNs there's no browser step. The username and password go over stdin
@@ -132,7 +139,7 @@ reached by IP address. On Windows the sign-in window doesn't do this yet.
 
 ## Files
 
-Data lives in `~/Library/Application Support/FortiBar/` on macOS, and in `data\` next to `FortiBar.exe` on Windows.
+Data lives in `~/Library/Application Support/FortiBar/` on macOS, and in `%LOCALAPPDATA%\FortiBar\` on Windows.
 
 | Path | What |
 |---|---|
@@ -145,4 +152,6 @@ Data lives in `~/Library/Application Support/FortiBar/` on macOS, and in `data\`
 | `vendor/` | openfortivpn source and build (macOS) |
 | `.cargo/`, `target/`, `dist/` | Rust crates, build output, packaged app |
 
-Older macOS builds kept data in the project's `data/` folder; it moves to Application Support the first time the app starts.
+Older builds kept data in a `data` folder (the project folder on macOS, next to `FortiBar.exe` on Windows); it moves
+to the new location the first time the app starts. If `vpns.json` can't be read, FortiBar renames it to
+`vpns.json.bad` and tells you, rather than starting over and overwriting your list.

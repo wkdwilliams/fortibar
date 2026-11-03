@@ -1,9 +1,9 @@
 use crate::config::{tunnel_program, Vpn};
 use crate::UserEvent;
 use std::io::{BufRead, BufReader, Read, Write};
-use std::process::{Command, Stdio};
+use std::process::{ChildStdin, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tao::event_loop::EventLoopProxy;
 
@@ -20,6 +20,10 @@ pub struct Tunnel {
     pub session: u64,
     pid: u32,
     exited: Arc<AtomicBool>,
+    /// macOS: the helper's stdin, held open while the tunnel should stay up.
+    /// If the app quits or crashes the pipe closes and the helper takes the
+    /// tunnel down, instead of leaving it running with nothing to control it.
+    keepalive: Mutex<Option<ChildStdin>>,
 }
 
 /// How the tunnel logs in. Either way the secret goes over stdin so it never
@@ -82,19 +86,19 @@ impl Tunnel {
             .spawn()?;
 
         let mut stdin = child.stdin.take().unwrap();
-        match auth {
-            Auth::Cookie(cookie) => writeln!(stdin, "SVPNCOOKIE={cookie}")?,
+        let secret = match auth {
+            Auth::Cookie(cookie) => format!("SVPNCOOKIE={cookie}\n"),
             // The helper takes the username on the first line (macOS);
             // openconnect gets it as --user and only wants the password.
-            Auth::Password { username, password } => {
-                #[cfg(target_os = "macos")]
-                writeln!(stdin, "USER={username}")?;
-                #[cfg(windows)]
-                let _ = username;
-                writeln!(stdin, "{password}")?;
+            Auth::Password { username, password } if cfg!(target_os = "macos") => {
+                format!("USER={username}\n{password}\n")
             }
-        }
-        drop(stdin);
+            Auth::Password { password, .. } => format!("{password}\n"),
+        };
+        // A failed write means the process already exited (e.g. sudo -n
+        // refused); its output and exit, forwarded below, say why.
+        let _ = stdin.write_all(secret.as_bytes()).and_then(|()| stdin.flush());
+        let keepalive = cfg!(target_os = "macos").then_some(stdin);
 
         forward_lines(child.stdout.take().unwrap(), session, proxy.clone());
         forward_lines(child.stderr.take().unwrap(), session, proxy.clone());
@@ -108,14 +112,20 @@ impl Tunnel {
             let _ = proxy.send_event(UserEvent::TunnelExited(session, code));
         });
 
-        Ok(Tunnel { vpn_id: vpn.id.clone(), session, pid, exited })
+        Ok(Tunnel { vpn_id: vpn.id.clone(), session, pid, exited, keepalive: Mutex::new(keepalive) })
     }
 
-    /// Asks the tunnel to shut down. On macOS sudo relays SIGTERM to the
-    /// helper, which passes it to openfortivpn so routes and DNS are
-    /// restored. On Windows the wintun adapter, and with it the VPN's routes
-    /// and DNS, goes away when openconnect exits.
+    /// Asks the tunnel to shut down. On macOS closing the helper's stdin
+    /// tells it to stop, and sudo also relays SIGTERM to it; it passes that
+    /// on to openfortivpn so routes and DNS are restored. On Windows the
+    /// wintun adapter, and with it the VPN's routes and DNS, goes away when
+    /// openconnect exits.
     pub fn stop(&self) {
+        // Already gone: the pid may belong to some other process by now.
+        if self.exited.load(Ordering::SeqCst) {
+            return;
+        }
+        drop(self.keepalive.lock().unwrap().take());
         #[cfg(unix)]
         unsafe {
             libc::kill(self.pid as i32, libc::SIGTERM);

@@ -12,6 +12,8 @@
 #   stdin: SVPNCOOKIE=<value>
 #      or: USER=<username>
 #          <password>
+#          then held open while the tunnel should stay up: EOF (the app
+#          disconnecting, quitting or crashing) takes the tunnel down.
 #
 # setup.sh installs this root-owned next to the openfortivpn binary in
 # /usr/local/libexec/fortibar and adds a sudoers rule for exactly this path.
@@ -27,7 +29,8 @@ GW="${1:-}"
 CERT="${2:-}"
 EXTRA_DOMAINS="${3:-}"
 
-if ! [[ "$GW" =~ ^[A-Za-z0-9.-]+:[0-9]{1,5}$ ]]; then
+# Starts with a letter or digit, so openfortivpn can't read it as an option.
+if ! [[ "$GW" =~ ^[A-Za-z0-9][A-Za-z0-9.-]*:[0-9]{1,5}$ ]]; then
 	echo "ERROR: invalid gateway '$GW'" >&2
 	exit 2
 fi
@@ -99,7 +102,9 @@ set_dns() {
 	[[ -z "$servers" ]] && return
 	for d in ${suffix//;/ } ${EXTRA_DOMAINS//,/ }; do
 		d="${d#.}"
-		[[ "$d" =~ ^[A-Za-z0-9.-]+$ && " $domains " != *" $d "* ]] && domains="$domains $d"
+		# At least two labels: a bare "com" would send every .com lookup to
+		# the VPN's DNS servers.
+		[[ "$d" =~ ^[A-Za-z0-9-]+(\.[A-Za-z0-9-]+)+$ && " $domains " != *" $d "* ]] && domains="$domains $d"
 	done
 
 	if [[ -z "$domains" ]]; then
@@ -130,7 +135,43 @@ clear_dns() {
 ARGS+=(--config= --set-dns=0 --pppd-use-peerdns=0)
 [[ -n "$CERT" ]] && ARGS+=(--trusted-cert "$CERT")
 
-printf '%s\n' "$SECRET" | "$OFV" "${ARGS[@]}" >"$FIFO" 2>&1 &
+# Set up before openfortivpn starts, so a stop request can't slip past.
+# sudo relays SIGTERM from the menu bar app to us; pass it on so openfortivpn
+# tears down routes and pppd cleanly, and kill it if it hasn't after 10s.
+OFV_PID=""
+STOPPING=0
+STOP_AT=0
+WATCH_PID=""
+on_stop() {
+	[[ -z "$OFV_PID" ]] && exit 143
+	(( STOPPING )) || { STOPPING=1; STOP_AT=$SECONDS; }
+	kill -TERM "$OFV_PID" 2>/dev/null
+}
+# Runs however the helper ends, so a split-DNS resolver never outlives the
+# tunnel it points into.
+cleanup() {
+	[[ -n "$WATCH_PID" ]] && kill "$WATCH_PID" 2>/dev/null
+	clear_dns >/dev/null 2>&1
+	rm -rf "$WORK"
+}
+trap on_stop TERM INT HUP
+trap cleanup EXIT
+
+# A resolver left behind by a helper that was killed outright.
+clear_dns >/dev/null 2>&1
+
+# The app holds our stdin open while it wants the tunnel up. EOF means it
+# disconnected, quit or crashed: stop, rather than leave a tunnel running
+# that nothing shows or controls. (Background jobs get /dev/null as stdin,
+# hence fd 3.)
+exec 3<&0
+(
+	cat <&3 >/dev/null
+	kill -TERM $$ 2>/dev/null
+) &
+WATCH_PID=$!
+
+printf '%s\n' "$SECRET" | "$OFV" "${ARGS[@]}" >"$FIFO" 2>&1 3<&- &
 OFV_PID=$!
 
 (
@@ -147,17 +188,14 @@ OFV_PID=$!
 ) &
 READER_PID=$!
 
-# sudo relays SIGTERM from the menu bar app to us; pass it on so
-# openfortivpn tears down routes and pppd cleanly.
-trap 'kill -TERM "$OFV_PID" 2>/dev/null' TERM INT HUP
-
-rc=0
+# Polls rather than blocking in `wait`, so a hung openfortivpn can be killed.
 while kill -0 "$OFV_PID" 2>/dev/null; do
-	wait "$OFV_PID"
-	rc=$?
+	if (( STOPPING && SECONDS - STOP_AT >= 10 )); then
+		kill -KILL "$OFV_PID" 2>/dev/null
+	fi
+	sleep 1
 done
+wait "$OFV_PID"
+rc=$?
 wait "$READER_PID" 2>/dev/null
-
-clear_dns >/dev/null 2>&1
-rm -rf "$WORK"
 exit "$rc"

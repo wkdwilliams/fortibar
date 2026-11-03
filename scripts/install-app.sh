@@ -57,10 +57,20 @@ if [[ -e "$target" && "$(bundle_id "$target")" != "$BUNDLE_ID" ]]; then
 	exit 1
 fi
 
+# A copy installed earlier with sudo can be root-owned even inside a folder
+# we can write to.
 sudo=()
-[[ -w "$dest" ]] || sudo=(sudo)
-"${sudo[@]+"${sudo[@]}"}" rm -rf "$target"
-"${sudo[@]+"${sudo[@]}"}" mv "$APP" "$target"
+if [[ ! -w "$dest" ]] || { [[ -e "$target" ]] && [[ -n "$(find "$target" ! -user "$(id -u)" -print -quit 2>/dev/null)" ]]; }; then
+	sudo=(sudo)
+fi
+run() { "${sudo[@]+"${sudo[@]}"}" "$@"; }
+# Move the new app in next to the old one first, so a failure partway
+# leaves the old install working.
+staged="$dest/.FortiBar.app.new"
+run rm -rf "$staged"
+run mv "$APP" "$staged"
+run rm -rf "$target"
+run mv "$staged" "$target"
 echo "Installed $target"
 
 # A copy left in the other Applications folder would be stale from now on.

@@ -80,7 +80,8 @@ struct App {
     tray: Option<TrayIcon>,
     _app_menu: Option<Menu>,
     auth: HashMap<String, AuthWindow>,
-    form: Option<(Window, WebView)>,
+    /// The add/edit window, and the id of the VPN it edits (None: a new one).
+    form: Option<(Window, WebView, Option<String>)>,
     /// Password prompt and the VPN it's for.
     login: Option<(String, Window, WebView)>,
     status: Status,
@@ -103,6 +104,8 @@ fn main() {
     let mut event_loop = EventLoopBuilder::<UserEvent>::with_user_event().build();
     #[cfg(target_os = "macos")]
     event_loop.set_activation_policy(ActivationPolicy::Accessory);
+
+    platform::init_notifications();
 
     // Refresh the login item's recorded path in case the app was moved.
     if platform::launch_at_login() {
@@ -146,7 +149,7 @@ fn main() {
             }
             Event::UserEvent(e) => app.on_event(target, e),
             Event::WindowEvent { window_id, event: WindowEvent::CloseRequested, .. } => {
-                if app.form.as_ref().is_some_and(|(w, _)| w.id() == window_id) {
+                if app.form.as_ref().is_some_and(|(w, ..)| w.id() == window_id) {
                     app.form = None;
                 } else if app.login.as_ref().is_some_and(|(_, w, _)| w.id() == window_id) {
                     app.cancel_login();
@@ -213,6 +216,12 @@ impl App {
 
     fn vpn(&self, id: &str) -> Option<&Vpn> {
         self.vpns.iter().find(|v| v.id == id)
+    }
+
+    fn save_vpns(&self) {
+        if let Err(e) = config::save(&self.vpns) {
+            alert("FortiBar couldn't save your VPNs", &e.to_string());
+        }
     }
 
     fn vpn_name(&self, id: &str) -> String {
@@ -333,7 +342,10 @@ impl App {
                     self.forget_login(target, &vpn_id);
                     self.auth.remove(&vpn_id);
                     self.vpns.retain(|v| v.id != vpn_id);
-                    config::save(&self.vpns);
+                    self.save_vpns();
+                    if self.form.as_ref().is_some_and(|f| f.2.as_deref() == Some(vpn_id.as_str())) {
+                        self.form = None;
+                    }
                 }
             }
             "log" => {
@@ -669,8 +681,12 @@ impl App {
         let prev = std::mem::replace(&mut self.status, Status::Idle);
         let password_login = self.password_login.take();
         let password_vpn = self.vpn(&tunnel.vpn_id).filter(|v| !v.sso).cloned();
+        let pending_cert = self.pending_cert.take();
+        let next_vpn = self.next_vpn.take();
 
-        if let Some(digest) = self.pending_cert.take() {
+        // Only offer to trust the certificate if the user is still waiting
+        // for this VPN, not after they disconnected or switched away.
+        if let (Some(digest), Status::Connecting(_)) = (pending_cert, &prev) {
             let msg = format!(
                 "The certificate for {name} isn't trusted by macOS.\n\nSHA-256: {digest}\n\nTrust it for this VPN?"
             );
@@ -678,8 +694,8 @@ impl App {
                 if let Some(v) = self.vpns.iter_mut().find(|v| v.id == tunnel.vpn_id) {
                     v.trusted_cert = digest;
                 }
-                config::save(&self.vpns);
-                return self.start_auth_with(target, &tunnel.vpn_id, password_login);
+                self.save_vpns();
+                self.start_auth_with(target, &tunnel.vpn_id, password_login);
             }
         } else if let (true, Status::Connecting(_), Some(vpn)) = (self.auth_failed, &prev, &password_vpn) {
             // Wrong password: drop any saved one and ask again.
@@ -688,8 +704,8 @@ impl App {
             self.open_login(target, vpn, "The gateway rejected the username or password.");
         } else {
             match prev {
-                Status::Disconnecting(_) => match self.next_vpn.take() {
-                    Some(next) => return self.start_auth(target, &next),
+                Status::Disconnecting(_) => match next_vpn {
+                    Some(next) => self.start_auth(target, &next),
                     None => notify("VPN disconnected", &name),
                 },
                 Status::Connected(_) => notify("VPN connection dropped", &name),
@@ -720,11 +736,12 @@ impl App {
     // ---- add / edit form ------------------------------------------------
 
     fn open_form(&mut self, target: &Target, vpn: Option<Vpn>) {
-        if let Some((w, _)) = &self.form {
+        if let Some((w, ..)) = &self.form {
             w.set_focus();
             return;
         }
         let title = if vpn.is_some() { "Edit VPN Connection" } else { "New VPN Connection" };
+        let editing = vpn.as_ref().map(|v| v.id.clone());
         let window = WindowBuilder::new()
             .with_title(title)
             .with_inner_size(LogicalSize::new(640.0, 690.0))
@@ -744,10 +761,14 @@ impl App {
             .build(&window)
             .expect("create form webview");
         window.set_focus();
-        self.form = Some((window, webview));
+        self.form = Some((window, webview, editing));
     }
 
     fn on_form(&mut self, body: String) {
+        // A second Save queued before the first closed the form would
+        // otherwise add the VPN twice.
+        let Some((_, _, editing)) = &self.form else { return };
+        let editing = editing.clone();
         let Ok(msg) = serde_json::from_str::<serde_json::Value>(&body) else { return };
         let s = |k: &str| msg[k].as_str().unwrap_or("").trim().to_string();
         if s("action") != "save" {
@@ -755,7 +776,7 @@ impl App {
             return;
         }
         let show_error = |text: &str| {
-            if let Some((_, wv)) = &self.form {
+            if let Some((_, wv, _)) = &self.form {
                 let _ = wv.evaluate_script(&format!("showError({})", serde_json::to_string(text).unwrap()));
             }
         };
@@ -795,7 +816,7 @@ impl App {
         };
 
         let vpn = Vpn {
-            id: msg["id"].as_str().map(String::from).unwrap_or_else(config::new_id),
+            id: editing.unwrap_or_else(config::new_id),
             name,
             description: s("description"),
             host,
@@ -808,15 +829,21 @@ impl App {
         };
         match self.vpns.iter_mut().find(|v| v.id == vpn.id) {
             Some(existing) => {
-                // A saved password belongs to the old account / setting.
-                if vpn.sso || !vpn.save_login || existing.username != vpn.username || existing.host != vpn.host {
+                // A saved password belongs to the old account / gateway.
+                if vpn.sso
+                    || !vpn.save_login
+                    || existing.username != vpn.username
+                    || existing.host != vpn.host
+                    || existing.port != vpn.port
+                    || existing.trusted_cert != vpn.trusted_cert
+                {
                     existing.forget_password();
                 }
                 *existing = vpn;
             }
             None => self.vpns.push(vpn),
         }
-        config::save(&self.vpns);
+        self.save_vpns();
         self.form = None;
         self.refresh();
     }
@@ -881,7 +908,7 @@ impl App {
         if vpn.username != username {
             vpn.forget_password();
             vpn.username = username.clone();
-            config::save(&self.vpns);
+            self.save_vpns();
         }
         let vpn = self.vpn(&id).cloned().unwrap();
         let auth = Auth::Password { username: username.clone(), password: password.clone() };

@@ -13,6 +13,10 @@ VENDOR="$ROOT/vendor"
 BIN=/usr/local/libexec/fortibar
 export CARGO_HOME="$ROOT/.cargo"   # crate downloads stay in this folder
 export CARGO_TARGET_DIR="$ROOT/target"
+# openfortivpn ends up running as root, so build a known commit rather than
+# whatever upstream HEAD is today. Bump deliberately, after reviewing changes.
+OFV_REPO=https://github.com/adrienverge/openfortivpn.git
+OFV_COMMIT=49e7b8c3881a849751aa67fc210ed5bd7054d6d5
 
 build_openfortivpn() {
 	local src="$VENDOR/openfortivpn-src"
@@ -22,8 +26,15 @@ build_openfortivpn() {
 		echo "openssl@3 not found. Install it with: brew install openssl@3" >&2
 		exit 1
 	fi
-	if [[ ! -d "$src" ]]; then
-		git clone --depth 1 https://github.com/adrienverge/openfortivpn.git "$src"
+	if [[ "$(git -C "$src" rev-parse HEAD 2>/dev/null)" != "$OFV_COMMIT" ]]; then
+		rm -rf "$src"
+		git init -q "$src"
+		git -C "$src" fetch -q --depth 1 "$OFV_REPO" "$OFV_COMMIT"
+		git -C "$src" checkout -q FETCH_HEAD
+	fi
+	if [[ "$(git -C "$src" rev-parse HEAD)" != "$OFV_COMMIT" ]]; then
+		echo "openfortivpn source isn't at the pinned commit $OFV_COMMIT" >&2
+		exit 1
 	fi
 	(
 		cd "$src"
@@ -37,6 +48,7 @@ build_openfortivpn() {
 		make -j"$(sysctl -n hw.ncpu)"
 		make install
 	)
+	echo "$OFV_COMMIT" >"$VENDOR/openfortivpn/.commit"
 }
 
 install_helper() {
@@ -63,8 +75,9 @@ build_app() {
 	cargo build --release --manifest-path "$ROOT/Cargo.toml"
 	local app="$ROOT/dist/FortiBar.app"
 	rm -rf "$app"
-	mkdir -p "$app/Contents/MacOS"
+	mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
 	cp "$ROOT/target/release/fortibar" "$app/Contents/MacOS/FortiBar"
+	cp "$ROOT/assets/FortiBar.icns" "$app/Contents/Resources/FortiBar.icns"
 	cat >"$app/Contents/Info.plist" <<-EOF
 	<?xml version="1.0" encoding="UTF-8"?>
 	<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -72,6 +85,7 @@ build_app() {
 	  <key>CFBundleName</key><string>FortiBar</string>
 	  <key>CFBundleIdentifier</key><string>local.fortibar</string>
 	  <key>CFBundleExecutable</key><string>FortiBar</string>
+	  <key>CFBundleIconFile</key><string>FortiBar</string>
 	  <key>CFBundlePackageType</key><string>APPL</string>
 	  <key>CFBundleVersion</key><string>0.1.0</string>
 	  <key>LSUIElement</key><true/>
@@ -90,7 +104,9 @@ if [[ "${1:-}" == "--app" ]]; then
 	exit 0
 fi
 
-if [[ ! -x "$VENDOR/openfortivpn/bin/openfortivpn" ]]; then
+# Rebuilt when missing or built from a different commit than the pin.
+if [[ ! -x "$VENDOR/openfortivpn/bin/openfortivpn" \
+	|| "$(cat "$VENDOR/openfortivpn/.commit" 2>/dev/null)" != "$OFV_COMMIT" ]]; then
 	build_openfortivpn
 fi
 install_helper
