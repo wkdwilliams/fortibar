@@ -4,7 +4,11 @@
 # macOS (scutil), which openfortivpn itself cannot do (it only knows
 # /etc/resolv.conf).
 #
-# usage: sudo fortivpn-helper <host:port> [trusted-cert-sha256]
+# usage: sudo fortivpn-helper <host:port> [trusted-cert-sha256] [dns-domains]
+#   trusted-cert-sha256: may be empty when only dns-domains is given
+#   dns-domains: comma-separated, e.g. corp.example.com,example.net; names
+#                under them go to the VPN's DNS servers, along with any
+#                domains the gateway pushes
 #   stdin: SVPNCOOKIE=<value>
 #      or: USER=<username>
 #          <password>
@@ -21,6 +25,7 @@ DNS_KEY="State:/Network/Service/fortibar/DNS"
 
 GW="${1:-}"
 CERT="${2:-}"
+EXTRA_DOMAINS="${3:-}"
 
 if ! [[ "$GW" =~ ^[A-Za-z0-9.-]+:[0-9]{1,5}$ ]]; then
 	echo "ERROR: invalid gateway '$GW'" >&2
@@ -28,6 +33,12 @@ if ! [[ "$GW" =~ ^[A-Za-z0-9.-]+:[0-9]{1,5}$ ]]; then
 fi
 if [[ -n "$CERT" ]] && ! [[ "$CERT" =~ ^[0-9A-Fa-f]{64}$ ]]; then
 	echo "ERROR: invalid trusted cert digest" >&2
+	exit 2
+fi
+# Length checked separately: macOS regex caps repeat counts at 255
+# (RE_DUP_MAX), and a bigger {m,n} fails to compile, rejecting everything.
+if ! [[ "$EXTRA_DOMAINS" =~ ^[A-Za-z0-9.,-]*$ && ${#EXTRA_DOMAINS} -le 1024 ]]; then
+	echo "ERROR: invalid DNS domains" >&2
 	exit 2
 fi
 
@@ -58,100 +69,58 @@ WORK="$(mktemp -d /tmp/fortibar.XXXXXX)"
 FIFO="$WORK/out"
 mkfifo "$FIFO"
 
-# Saves a dynamic-store key's dictionary (or "No such key") to a file.
-save_key() {
-	printf 'get %s\nd.show\n' "$1" | scutil >"$2" 2>&1
-}
-
-# Puts back a key saved by save_key, or removes it if it did not exist.
-restore_key() {
-	local key="$1" file="$2"
-	if grep -q 'No such key' "$file"; then
-		printf 'remove %s\n' "$key" | scutil
-	else
-		{
-			echo "d.init"
-			awk -F' : ' '
-				/^  [A-Za-z]+ : <array>/ {key=$1; gsub(/ /,"",key); vals=""; inarr=1; next}
-				inarr && /^  }/ {print "d.add " key " *" vals; inarr=0; next}
-				inarr {split($0, kv, " : "); vals = vals " " kv[2]; next}
-				/^  [A-Za-z]+ : / {k=$1; gsub(/ /,"",k); print "d.add " k " " $2}
-			' "$file"
-			echo "set $key"
-		} | scutil
-	fi
-}
-
-# Primary-service DNS override, used only when the gateway sends no DNS
-# suffix (so split DNS has nothing to match on).
-backup_primary_dns() {
-	local svc
-	svc="$(printf 'show State:/Network/Global/IPv4\n' | scutil | awk '/PrimaryService/ {print $3}')"
-	[[ -z "$svc" ]] && return 1
-	echo "$svc" >"$WORK/primary"
-	save_key "State:/Network/Service/$svc/DNS" "$WORK/primary.dns"
-	save_key "Setup:/Network/Service/$svc/DNS" "$WORK/primary.setup.dns"
-	return 0
-}
-
+# Wires the VPN's DNS servers in as a split-DNS resolver: only names under the
+# VPN's domains go to them. The resolver isn't tied to an interface, so its
+# queries follow the routing table into the tunnel and leave from the tunnel
+# address, which is the only source the gateway's DNS servers answer.
+#
+# There is deliberately no "all lookups via the VPN" mode. Overriding the
+# primary service's DNS ties the servers to Wi-Fi/Ethernet, so queries leave
+# from that interface's address, time out, and fall through to any public
+# server in the list, which answers NXDOMAIN for internal names.
+#
+# Runs once the tunnel is up, so the gateway's routes are in place.
 set_dns() {
 	# "Got addresses: [10.1.2.3], ns [10.0.0.1, 10.0.0.2], ns_suffix [a.local;b.local]"
-	local line="$1" ns suffix servers="" domains=""
+	local line="$1" ns suffix all="" servers="" domains="" s d
 	ns="$(sed -n 's/.*ns \[\([^]]*\)\].*/\1/p' <<<"$line")"
 	suffix="$(sed -n 's/.*ns_suffix \[\([^]]*\)\].*/\1/p' <<<"$line")"
 	for s in ${ns//,/ }; do
-		[[ "$s" != "0.0.0.0" && "$s" =~ ^[0-9.]+$ ]] && servers="$servers $s"
-	done
-	for d in ${suffix//;/ }; do
-		[[ "$d" =~ ^[A-Za-z0-9.-]+$ ]] && domains="$domains $d"
-	done
-	[[ -z "$servers" ]] && return
-
-	if [[ -n "$domains" ]]; then
-		# Split DNS: only names under the VPN's domains go to its servers.
-		scutil <<-EOF
-			d.init
-			d.add ServerAddresses *$servers
-			d.add SearchDomains *$domains
-			d.add SupplementalMatchDomains *$domains
-			set $DNS_KEY
-		EOF
-		echo "DNS: split DNS for$domains via$servers"
-	elif backup_primary_dns; then
-		local svc
-		svc="$(cat "$WORK/primary")"
-		scutil <<-EOF
-			d.init
-			d.add ServerAddresses *$servers
-			set State:/Network/Service/$svc/DNS
-		EOF
-		# DNS servers typed into System Settings live under Setup: and win
-		# over State:, so override them too while connected. This only
-		# touches the dynamic store, not the saved network preferences.
-		if grep -q ServerAddresses "$WORK/primary.setup.dns"; then
-			touch "$WORK/primary.setup.overridden"
-			scutil <<-EOF
-				d.init
-				d.add ServerAddresses *$servers
-				set Setup:/Network/Service/$svc/DNS
-			EOF
+		[[ "$s" != "0.0.0.0" && "$s" =~ ^[0-9.]+$ ]] || continue
+		all="$all $s"
+		# Keep only servers reached through the tunnel. A public server the
+		# gateway also lists (e.g. 8.8.8.8) can't know internal names, and
+		# its NXDOMAIN could win over the real answer.
+		if [[ "$(route -n get "$s" 2>/dev/null | awk '/interface:/ {print $2}')" == ppp* ]]; then
+			servers="$servers $s"
 		fi
-		echo "DNS: all lookups via$servers"
+	done
+	[[ -z "$servers" ]] && servers="$all"
+	[[ -z "$servers" ]] && return
+	for d in ${suffix//;/ } ${EXTRA_DOMAINS//,/ }; do
+		d="${d#.}"
+		[[ "$d" =~ ^[A-Za-z0-9.-]+$ && " $domains " != *" $d "* ]] && domains="$domains $d"
+	done
+
+	if [[ -z "$domains" ]]; then
+		echo "DNS: the gateway sent DNS servers$servers but no DNS domains, so they aren't used." \
+			"To resolve internal names, add the VPN's domains under DNS Domains in Edit VPN."
+		return
 	fi
+	scutil <<-EOF
+		d.init
+		d.add ServerAddresses *$servers
+		d.add SearchDomains *$domains
+		d.add SupplementalMatchDomains *$domains
+		set $DNS_KEY
+	EOF
+	echo "DNS: names under$domains go to$servers"
 	dscacheutil -flushcache 2>/dev/null
 	killall -HUP mDNSResponder 2>/dev/null
 }
 
 clear_dns() {
 	printf 'remove %s\n' "$DNS_KEY" | scutil
-	if [[ -f "$WORK/primary" ]]; then
-		local svc
-		svc="$(cat "$WORK/primary")"
-		restore_key "State:/Network/Service/$svc/DNS" "$WORK/primary.dns"
-		if [[ -f "$WORK/primary.setup.overridden" ]]; then
-			restore_key "Setup:/Network/Service/$svc/DNS" "$WORK/primary.setup.dns"
-		fi
-	fi
 	dscacheutil -flushcache 2>/dev/null
 	killall -HUP mDNSResponder 2>/dev/null
 }
@@ -167,10 +136,12 @@ OFV_PID=$!
 (
 	# Keep handling DNS even if the app went away and stdout is closed.
 	trap '' PIPE
+	addresses=""
 	while IFS= read -r line; do
 		echo "$line" 2>/dev/null
 		case "$line" in
-			*"Got addresses:"*) set_dns "$line" ;;
+			*"Got addresses:"*) addresses="$line" ;;
+			*"Tunnel is up and running."*) [[ -n "$addresses" ]] && set_dns "$addresses" ;;
 		esac
 	done <"$FIFO"
 ) &

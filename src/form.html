@@ -53,6 +53,9 @@
   <div class="row"><label class="l" for="trustedCert">Trusted Cert</label>
     <div><input type="text" id="trustedCert" placeholder="optional SHA-256 digest">
     <div class="hint">Only for gateways with a self-signed certificate. You'll be asked if it's needed.</div></div></div>
+  <div class="row mac"><label class="l" for="dnsDomains">DNS Domains</label>
+    <div><input type="text" id="dnsDomains" placeholder="optional, e.g. corp.example.com">
+    <div class="hint">Names under these domains are looked up on the VPN's DNS servers. Needed when internal names don't resolve.</div></div></div>
   <div class="err" id="err"></div>
   <div class="buttons"><button type="button" id="cancel">Cancel</button><button type="submit">Save</button></div>
 </form>
@@ -77,7 +80,9 @@
     if (v.port !== 443) { $('customPort').checked = true; $('port').disabled = false; $('port').value = v.port; }
     $('sso').checked = v.sso; $('username').value = v.username;
     $(v.sso || v.save_login ? 'save' : 'prompt').checked = true;
+    $('dnsDomains').value = (v.dns_domains || []).join(', ');
   }
+  if (navigator.platform.startsWith('Win')) document.querySelectorAll('.mac').forEach(r => r.classList.add('hidden'));
   syncAuth();
   $('cancel').onclick = () => send({ action: 'cancel' });
   document.addEventListener('keydown', e => { if (e.key === 'Escape') send({ action: 'cancel' }); });
@@ -94,6 +99,7 @@
       sso: $('sso').checked,
       save_login: $('save').checked,
       username: $('username').value.trim(),
+      dns_domains: $('dnsDomains').value.trim(),
     });
   };
   window.showError = msg => { $('err').textContent = msg; };
