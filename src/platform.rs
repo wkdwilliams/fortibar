@@ -35,14 +35,20 @@ mod imp {
         use objc2::runtime::{AnyClass, AnyObject, Bool, ClassBuilder, Imp, Sel};
         use objc2::{class, msg_send, sel};
         use std::ffi::CString;
-        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::ffi::CStr;
+        use std::os::raw::c_char;
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
         use std::sync::OnceLock;
+        use std::time::Duration;
 
         #[link(name = "UserNotifications", kind = "framework")]
         extern "C" {}
 
         const AUTHORIZE_ALERT: usize = 1 << 2;
         const PRESENT_LIST_AND_BANNER: usize = (1 << 3) | (1 << 4);
+        /// UNAuthorizationStatusDenied: the user said no, or turned them off
+        /// in System Settings. macOS won't ask again, so we have to.
+        const STATUS_DENIED: isize = 1;
 
         struct Center(*mut AnyObject);
         // UNUserNotificationCenter is thread-safe.
@@ -50,6 +56,8 @@ mod imp {
         unsafe impl Sync for Center {}
 
         static CENTER: OnceLock<Option<Center>> = OnceLock::new();
+        static DENIED: AtomicBool = AtomicBool::new(false);
+        static ON_CHANGE: OnceLock<Box<dyn Fn() + Send + Sync>> = OnceLock::new();
 
         fn ns_string(s: &str) -> *mut AnyObject {
             let s = CString::new(s.replace('\0', "")).unwrap();
@@ -95,15 +103,73 @@ mod imp {
                 }
                 let center: *mut AnyObject = msg_send![class!(UNUserNotificationCenter), currentNotificationCenter];
                 let _: () = msg_send![center, setDelegate: delegate()];
-                let done = RcBlock::new(|_granted: Bool, _error: *mut AnyObject| {});
+                // Once the prompt is answered (or skipped, if it was answered
+                // before), find out whether notifications are blocked.
+                let done = RcBlock::new(move |_granted: Bool, _error: *mut AnyObject| check_center(center));
                 let _: () = msg_send![center, requestAuthorizationWithOptions: AUTHORIZE_ALERT, completionHandler: &*done];
                 Some(Center(center))
             });
             center.as_ref().map(|c| c.0)
         }
 
-        pub fn init() {
+        pub fn init(on_change: Box<dyn Fn() + Send + Sync>) {
+            let _ = ON_CHANGE.set(on_change);
             center();
+        }
+
+        fn check_center(center: *mut AnyObject) {
+            let done = RcBlock::new(|settings: *mut AnyObject| {
+                if settings.is_null() {
+                    return;
+                }
+                let status: isize = unsafe { msg_send![settings, authorizationStatus] };
+                let denied = status == STATUS_DENIED;
+                if DENIED.swap(denied, Ordering::Relaxed) != denied {
+                    if let Some(f) = ON_CHANGE.get() {
+                        f();
+                    }
+                }
+            });
+            unsafe {
+                let _: () = msg_send![center, getNotificationSettingsWithCompletionHandler: &*done];
+            }
+        }
+
+        pub fn denied() -> bool {
+            DENIED.load(Ordering::Relaxed)
+        }
+
+        fn bundle_id() -> Option<String> {
+            unsafe {
+                let bundle: *mut AnyObject = msg_send![class!(NSBundle), mainBundle];
+                let id: *mut AnyObject = msg_send![bundle, bundleIdentifier];
+                if id.is_null() {
+                    return None;
+                }
+                let utf8: *const c_char = msg_send![id, UTF8String];
+                (!utf8.is_null()).then(|| CStr::from_ptr(utf8).to_string_lossy().into_owned())
+            }
+        }
+
+        /// Opens FortiBar's page in System Settings → Notifications, then
+        /// keeps checking for a couple of minutes so the menu updates as soon
+        /// as they're turned on.
+        pub fn open_settings() {
+            let Some(id) = bundle_id() else { return };
+            let url = format!("x-apple.systempreferences:com.apple.Notifications-Settings.extension?id={id}");
+            let _ = std::process::Command::new("open").arg(url).spawn();
+            let Some(center) = center() else { return };
+            let center = Center(center);
+            std::thread::spawn(move || {
+                let center = center;
+                for _ in 0..60 {
+                    std::thread::sleep(Duration::from_secs(2));
+                    check_center(center.0);
+                    if !denied() {
+                        break;
+                    }
+                }
+            });
         }
 
         pub fn post(title: &str, message: &str) -> bool {
@@ -135,12 +201,33 @@ mod imp {
     }
 
     /// Call once at startup so macOS asks for notification permission then,
-    /// not at the first connect.
-    pub fn init_notifications() {
-        un::init();
+    /// not at the first connect. `on_change` runs (on any thread) whenever
+    /// `notifications_denied` changes.
+    pub fn init_notifications(on_change: impl Fn() + Send + Sync + 'static) {
+        un::init(Box::new(on_change));
+    }
+
+    /// The user has blocked FortiBar's notifications, so macOS won't show
+    /// them or ask again until they're turned on in System Settings.
+    pub fn notifications_denied() -> bool {
+        un::denied()
+    }
+
+    pub fn open_notification_settings() {
+        un::open_settings();
+    }
+
+    static MUTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+    /// Turned off in FortiBar's menu: `notify` does nothing.
+    pub fn set_notifications_muted(muted: bool) {
+        MUTED.store(muted, std::sync::atomic::Ordering::Relaxed);
     }
 
     pub fn notify(title: &str, message: &str) {
+        if MUTED.load(std::sync::atomic::Ordering::Relaxed) {
+            return;
+        }
         if un::post(title, message) {
             return;
         }
@@ -250,7 +337,15 @@ mod imp {
         }
     }
 
-    pub fn init_notifications() {}
+    pub fn init_notifications(_on_change: impl Fn() + Send + Sync + 'static) {}
+
+    pub fn notifications_denied() -> bool {
+        false
+    }
+
+    pub fn open_notification_settings() {}
+
+    pub fn set_notifications_muted(_muted: bool) {}
 
     /// The tray icon colour and tooltip already show connection state.
     pub fn notify(_title: &str, _message: &str) {}

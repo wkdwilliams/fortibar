@@ -52,6 +52,8 @@ pub enum UserEvent {
     Reconnect(String, u64),
     /// A request from fortibar-mcp (an AI agent), answered on the sender.
     Control(Command, mpsc::Sender<Value>),
+    /// Notifications were blocked or unblocked for FortiBar.
+    NotificationsChanged,
 }
 
 enum Status {
@@ -133,14 +135,17 @@ fn main() {
     #[cfg(target_os = "macos")]
     event_loop.set_activation_policy(ActivationPolicy::Accessory);
 
-    platform::init_notifications();
-
     // Refresh the login item's recorded path in case the app was moved.
     if platform::launch_at_login() {
         platform::set_launch_at_login(true);
     }
 
     let proxy = event_loop.create_proxy();
+    let notify_proxy = proxy.clone();
+    platform::init_notifications(move || {
+        let _ = notify_proxy.send_event(UserEvent::NotificationsChanged);
+    });
+    platform::set_notifications_muted(!notifications_wanted());
     let menu_proxy = proxy.clone();
     MenuEvent::set_event_handler(Some(move |e| {
         let _ = menu_proxy.send_event(UserEvent::Menu(e));
@@ -331,6 +336,12 @@ impl App {
         let _ = menu.append(&MenuItem::with_id("log", "Show Log", !self.log.is_empty(), None));
         let login = platform::launch_at_login();
         let _ = menu.append(&CheckMenuItem::with_id("login", "Start at Login", true, login, None));
+        // Windows has no notifications (the tray icon shows the state).
+        #[cfg(target_os = "macos")]
+        {
+            let on = notifications_wanted() && !platform::notifications_denied();
+            let _ = menu.append(&CheckMenuItem::with_id("notifications", "Notifications", true, on, None));
+        }
         let _ = menu.append(&PredefinedMenuItem::separator());
         let _ = menu.append(&MenuItem::with_id("quit", "Quit FortiBar", true, None));
     }
@@ -395,6 +406,16 @@ impl App {
                 platform::open_text(&path);
             }
             "login" => platform::set_launch_at_login(!platform::launch_at_login()),
+            "notifications" => {
+                // macOS is blocking them: only System Settings can turn them
+                // back on, so open it rather than just ticking the box.
+                if platform::notifications_denied() {
+                    set_notifications_wanted(true);
+                    platform::open_notification_settings();
+                } else {
+                    set_notifications_wanted(!notifications_wanted());
+                }
+            }
             "quit" => {
                 control::stop();
                 if let Some(t) = &self.tunnel {
@@ -748,6 +769,7 @@ impl App {
             UserEvent::Control(command, reply) => {
                 let _ = reply.send(self.on_control(target, command));
             }
+            UserEvent::NotificationsChanged => self.refresh(),
         }
     }
 
@@ -1167,6 +1189,22 @@ impl App {
 }
 
 // ---- helpers -------------------------------------------------------------
+
+/// Whether the user wants FortiBar's notifications (the Notifications menu
+/// item). Off is recorded as a file in the data folder.
+fn notifications_wanted() -> bool {
+    !config::data_dir().join("notifications-off").exists()
+}
+
+fn set_notifications_wanted(on: bool) {
+    let path = config::data_dir().join("notifications-off");
+    if on {
+        let _ = std::fs::remove_file(&path);
+    } else {
+        let _ = std::fs::write(&path, "");
+    }
+    platform::set_notifications_muted(!on);
+}
 
 fn center(window: &Window) {
     if let Some(monitor) = window.current_monitor() {
