@@ -131,6 +131,13 @@ pub struct Vpn {
     /// the VPN's DNS servers aren't used.
     #[serde(default)]
     pub dns_domains: Vec<String>,
+    /// A host on the VPN that FortiBar pings every minute while connected,
+    /// for gateways that drop idle tunnels. Empty: no keep-alive.
+    #[serde(default)]
+    pub keepalive_host: String,
+    /// Reconnect by itself when the gateway or the network drops the tunnel.
+    #[serde(default)]
+    pub auto_reconnect: bool,
 }
 
 fn yes() -> bool {
@@ -245,11 +252,22 @@ pub fn parse_gateway(input: &str) -> Option<(String, Option<u16>)> {
         Some((h, p)) => (h, Some(p.parse::<u16>().ok()?)),
         None => (s, None),
     };
-    // Must start with a letter or digit: a leading '-' would be read as an
-    // option by openfortivpn / openconnect.
-    let valid = host.starts_with(|c: char| c.is_ascii_alphanumeric())
-        && host.chars().all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-');
-    valid.then(|| (host.to_ascii_lowercase(), port))
+    valid_host(host).then(|| (host.to_ascii_lowercase(), port))
+}
+
+/// A hostname or IPv4 address. Must start with a letter or digit: a leading
+/// '-' would be read as an option by openfortivpn / openconnect / ping.
+fn valid_host(host: &str) -> bool {
+    host.len() <= 253
+        && host.starts_with(|c: char| c.is_ascii_alphanumeric())
+        && host.chars().all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-')
+}
+
+/// The keep-alive host as typed in the form: "" (off) or a hostname / IPv4
+/// address. None if it's neither.
+pub fn parse_keepalive_host(input: &str) -> Option<String> {
+    let host = input.trim();
+    (host.is_empty() || valid_host(host)).then(|| host.to_ascii_lowercase())
 }
 
 fn config_file() -> PathBuf {
@@ -363,6 +381,18 @@ mod tests {
         assert!(v.sso);
         assert!(v.username.is_empty());
         assert!(v.dns_domains.is_empty());
+        assert!(v.keepalive_host.is_empty());
+        assert!(!v.auto_reconnect);
+    }
+
+    #[test]
+    fn keepalive_hosts() {
+        assert_eq!(parse_keepalive_host("").as_deref(), Some(""));
+        assert_eq!(parse_keepalive_host(" 10.1.2.3 ").as_deref(), Some("10.1.2.3"));
+        assert_eq!(parse_keepalive_host("Intranet.Example.COM").as_deref(), Some("intranet.example.com"));
+        assert_eq!(parse_keepalive_host("-c 999 host"), None);
+        assert_eq!(parse_keepalive_host("-t1"), None);
+        assert_eq!(parse_keepalive_host("a b"), None);
     }
 
     #[test]
@@ -393,6 +423,8 @@ mod tests {
             username: String::new(),
             save_login: false,
             dns_domains: Vec::new(),
+            keepalive_host: String::new(),
+            auto_reconnect: false,
         };
         let b = Vpn { id: new_id(), ..a.clone() };
         assert_eq!(a.id.len(), 32);

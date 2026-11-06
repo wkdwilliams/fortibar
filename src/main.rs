@@ -1,6 +1,7 @@
 #![cfg_attr(windows, windows_subsystem = "windows")]
 
 mod config;
+mod control;
 mod icon;
 mod platform;
 #[cfg(target_os = "macos")]
@@ -8,9 +9,12 @@ mod tls;
 mod tunnel;
 
 use config::Vpn;
+use control::Command;
+use serde_json::{json, Value};
 use platform::{alert, confirm, notify};
 use std::collections::{HashMap, VecDeque};
-use std::time::Duration;
+use std::sync::mpsc;
+use std::time::{Duration, Instant};
 use tao::dpi::{LogicalPosition, LogicalSize};
 use tao::event::{Event, StartCause, WindowEvent};
 use tao::event_loop::{ControlFlow, EventLoopBuilder, EventLoopProxy, EventLoopWindowTarget};
@@ -43,6 +47,11 @@ pub enum UserEvent {
     Login(String),
     TunnelLine(u64, String),
     TunnelExited(u64, Option<i32>),
+    /// Time for the next automatic reconnect attempt; the u64 matches
+    /// `App::reconnect_token` unless the attempt was cancelled since.
+    Reconnect(String, u64),
+    /// A request from fortibar-mcp (an AI agent), answered on the sender.
+    Control(Command, mpsc::Sender<Value>),
 }
 
 enum Status {
@@ -51,7 +60,17 @@ enum Status {
     Connecting(String),
     Connected(String),
     Disconnecting(String),
+    /// The tunnel dropped and auto-reconnect is waiting to try again.
+    Reconnecting(String),
 }
+
+/// Waits before each automatic reconnect attempt; the last repeats.
+const RECONNECT_DELAYS: [u64; 5] = [2, 5, 15, 30, 60];
+/// Gives up after this many attempts in a row (about 7 minutes).
+const MAX_RECONNECTS: u32 = 10;
+/// A tunnel that stayed up this long counts as working again, so the next
+/// drop starts the attempts from the beginning.
+const STABLE_AFTER: Duration = Duration::from_secs(60);
 
 type Target = EventLoopWindowTarget<UserEvent>;
 
@@ -97,6 +116,15 @@ struct App {
     attempt: u64,
     session: u64,
     log: VecDeque<String>,
+    /// Why the last connect attempt failed or dropped, for AI agents, which
+    /// can't see the alert.
+    last_error: Option<String>,
+    /// The VPN whose sign-in / tunnel in progress is an automatic reconnect.
+    reconnecting: Option<String>,
+    /// Automatic reconnect attempts in a row.
+    retries: u32,
+    reconnect_token: u64,
+    connected_at: Option<Instant>,
 }
 
 fn main() {
@@ -136,7 +164,13 @@ fn main() {
         attempt: 0,
         session: 0,
         log: VecDeque::new(),
+        last_error: None,
+        reconnecting: None,
+        retries: 0,
+        reconnect_token: 0,
+        connected_at: None,
     };
+    control::start(app.proxy.clone());
 
     event_loop.run(move |event, target, control_flow| {
         *control_flow = ControlFlow::Wait;
@@ -158,6 +192,7 @@ fn main() {
                 {
                     app.auth[&id].window.set_visible(false);
                     if matches!(&app.status, Status::SigningIn(s) if *s == id) {
+                        app.stop_reconnecting();
                         app.status = Status::Idle;
                         app.refresh();
                     }
@@ -230,7 +265,9 @@ impl App {
 
     fn active_vpn(&self) -> Option<&str> {
         match &self.status {
-            Status::SigningIn(id) | Status::Connecting(id) | Status::Connected(id) => Some(id),
+            Status::SigningIn(id) | Status::Connecting(id) | Status::Connected(id) | Status::Reconnecting(id) => {
+                Some(id)
+            }
             _ => None,
         }
     }
@@ -260,6 +297,7 @@ impl App {
             Status::Connecting(id) => format!("Connecting to {}…", self.vpn_name(id)),
             Status::Connected(id) => format!("Connected to {}", self.vpn_name(id)),
             Status::Disconnecting(id) => format!("Disconnecting from {}…", self.vpn_name(id)),
+            Status::Reconnecting(id) => format!("Reconnecting to {}… (attempt {})", self.vpn_name(id), self.retries),
         }
     }
 
@@ -275,7 +313,8 @@ impl App {
         }
         let _ = menu.append(&PredefinedMenuItem::separator());
 
-        let can_disconnect = self.tunnel.is_some() || matches!(self.status, Status::SigningIn(_));
+        let can_disconnect =
+            self.tunnel.is_some() || matches!(self.status, Status::SigningIn(_) | Status::Reconnecting(_));
         let _ = menu.append(&MenuItem::with_id("disconnect", "Disconnect", can_disconnect, None));
         let _ = menu.append(&PredefinedMenuItem::separator());
         let _ = menu.append(&MenuItem::with_id("add", "Add VPN…", true, None));
@@ -303,7 +342,9 @@ impl App {
         let connected = matches!(self.status, Status::Connected(_));
         let title = match &self.status {
             Status::Connected(id) => Some(self.vpn_name(id)),
-            Status::SigningIn(_) | Status::Connecting(_) | Status::Disconnecting(_) => Some("…".to_string()),
+            Status::SigningIn(_) | Status::Connecting(_) | Status::Disconnecting(_) | Status::Reconnecting(_) => {
+                Some("…".to_string())
+            }
             // tray-icon ignores a None title on macOS, leaving the old one up.
             Status::Idle => Some(String::new()),
         };
@@ -355,6 +396,7 @@ impl App {
             }
             "login" => platform::set_launch_at_login(!platform::launch_at_login()),
             "quit" => {
+                control::stop();
                 if let Some(t) = &self.tunnel {
                     t.stop();
                     t.wait_exit(Duration::from_secs(8));
@@ -370,7 +412,14 @@ impl App {
     // ---- connect / disconnect -------------------------------------------
 
     fn connect(&mut self, target: &Target, id: String) {
+        // Anything the user starts replaces an automatic reconnect.
+        self.stop_reconnecting();
         match &self.status {
+            // Clicking a VPN that's waiting to reconnect cancels that.
+            Status::Reconnecting(cur) if *cur == id => {
+                self.status = Status::Idle;
+                return;
+            }
             // Clicking the active VPN toggles it off.
             Status::Connected(cur) | Status::Connecting(cur) if *cur == id => return self.disconnect(),
             Status::SigningIn(cur) if *cur == id => {
@@ -403,9 +452,12 @@ impl App {
 
     fn disconnect(&mut self) {
         self.next_vpn = None;
+        self.stop_reconnecting();
         if let Some(t) = &self.tunnel {
             self.status = Status::Disconnecting(t.vpn_id.clone());
             t.stop();
+        } else if let Status::Reconnecting(_) = &self.status {
+            self.status = Status::Idle;
         } else if let Status::SigningIn(id) = &self.status {
             if let Some(a) = self.auth.get(id) {
                 a.window.set_visible(false);
@@ -419,6 +471,7 @@ impl App {
     fn cancel_login(&mut self) {
         if let Some((id, _, _)) = self.login.take() {
             if matches!(&self.status, Status::SigningIn(s) if *s == id) {
+                self.stop_reconnecting();
                 self.status = Status::Idle;
                 self.refresh();
             }
@@ -429,10 +482,69 @@ impl App {
         self.start_auth_with(target, id, None);
     }
 
+    fn stop_reconnecting(&mut self) {
+        self.reconnecting = None;
+        self.retries = 0;
+        // Invalidates any attempt already scheduled.
+        self.reconnect_token += 1;
+    }
+
+    /// The tunnel to `id` dropped, or an automatic attempt to bring it back
+    /// failed: wait, then try again, or give up after MAX_RECONNECTS.
+    fn schedule_reconnect(&mut self, id: &str) {
+        let name = self.vpn_name(id);
+        if self.retries >= MAX_RECONNECTS {
+            let tries = self.retries;
+            self.stop_reconnecting();
+            self.status = Status::Idle;
+            self.last_error = Some(format!("Couldn't reconnect to {name} after {tries} attempts."));
+            notify("Couldn't reconnect the VPN", &name);
+            return;
+        }
+        let delay = RECONNECT_DELAYS[(self.retries as usize).min(RECONNECT_DELAYS.len() - 1)];
+        if self.retries == 0 {
+            notify("VPN connection dropped – reconnecting", &name);
+        }
+        self.retries += 1;
+        self.reconnect_token += 1;
+        self.status = Status::Reconnecting(id.to_string());
+        self.push_log(format!("FortiBar: reconnecting in {delay}s (attempt {} of {MAX_RECONNECTS})", self.retries));
+        self.later(Duration::from_secs(delay), UserEvent::Reconnect(id.to_string(), self.reconnect_token));
+    }
+
+    fn on_reconnect(&mut self, target: &Target, id: String, token: u64) {
+        let waiting = matches!(&self.status, Status::Reconnecting(s) if *s == id);
+        if !waiting || token != self.reconnect_token {
+            return;
+        }
+        // Turned off in Edit VPN while waiting.
+        if !self.vpn(&id).is_some_and(|v| v.auto_reconnect) {
+            self.stop_reconnecting();
+            self.status = Status::Idle;
+            return self.refresh();
+        }
+        self.reconnecting = Some(id.clone());
+        let last_error = self.last_error.clone();
+        self.start_auth(target, &id);
+        // Keep saying why we're reconnecting until it's back up.
+        if self.last_error.is_none() {
+            self.last_error = last_error;
+        }
+        self.refresh();
+    }
+
+    fn push_log(&mut self, line: String) {
+        self.log.push_back(line);
+        if self.log.len() > control::MAX_LOG_LINES {
+            self.log.pop_front();
+        }
+    }
+
     /// `retry` carries the credentials of a password tunnel being restarted
     /// (after trusting its certificate), so the user isn't asked again.
     fn start_auth_with(&mut self, target: &Target, id: &str, retry: Option<PasswordLogin>) {
         let Some(vpn) = self.vpn(id).cloned() else { return };
+        self.last_error = None;
         if vpn.sso {
             return self.start_saml(target, &vpn);
         }
@@ -561,9 +673,9 @@ impl App {
         if !config::tunnel_program().exists() {
             self.status = Status::Idle;
             #[cfg(target_os = "macos")]
-            alert("FortiBar isn't set up yet", "Run ./setup.sh in the FortiBar project folder once, then try again.");
+            self.fail("FortiBar isn't set up yet", "Run ./setup.sh in the FortiBar project folder once, then try again.");
             #[cfg(windows)]
-            alert(
+            self.fail(
                 "openconnect is missing",
                 "The openconnect folder should sit next to FortiBar.exe. Re-extract the FortiBar zip.",
             );
@@ -574,7 +686,11 @@ impl App {
         self.sudo_failed = false;
         self.auth_failed = false;
         self.password_login = password_login;
-        self.log.clear();
+        // Keep the log across automatic reconnects, so it still shows why
+        // the tunnel dropped.
+        if self.reconnecting.is_none() {
+            self.log.clear();
+        }
         match Tunnel::start(vpn, &auth, self.session, self.proxy.clone()) {
             Ok(t) => {
                 self.tunnel = Some(t);
@@ -582,7 +698,7 @@ impl App {
             }
             Err(e) => {
                 self.status = Status::Idle;
-                alert("Couldn't start the VPN", &e.to_string());
+                self.fail("Couldn't start the VPN", &e.to_string());
             }
         }
     }
@@ -628,6 +744,10 @@ impl App {
             UserEvent::Login(body) => self.on_login(body),
             UserEvent::TunnelLine(session, line) => self.on_tunnel_line(session, line),
             UserEvent::TunnelExited(session, code) => self.on_tunnel_exit(target, session, code),
+            UserEvent::Reconnect(id, token) => self.on_reconnect(target, id, token),
+            UserEvent::Control(command, reply) => {
+                let _ = reply.send(self.on_control(target, command));
+            }
         }
     }
 
@@ -645,7 +765,16 @@ impl App {
                         vpn.save_password(&login.password);
                     }
                 }
-                notify("VPN connected", &self.vpn_name(&id));
+                match self.reconnecting.take() {
+                    Some(_) => notify("VPN reconnected", &self.vpn_name(&id)),
+                    None => notify("VPN connected", &self.vpn_name(&id)),
+                }
+                self.last_error = None;
+                self.connected_at = Some(Instant::now());
+                let host = self.vpn(&id).map(|v| v.keepalive_host.clone()).unwrap_or_default();
+                if let (false, Some(t)) = (host.is_empty(), &self.tunnel) {
+                    t.keep_alive(host, self.proxy.clone());
+                }
                 self.status = Status::Connected(id);
                 self.refresh();
             }
@@ -666,10 +795,7 @@ impl App {
                 self.pending_cert = Some(digest.to_string());
             }
         }
-        self.log.push_back(line);
-        if self.log.len() > 500 {
-            self.log.pop_front();
-        }
+        self.push_log(line);
     }
 
     fn on_tunnel_exit(&mut self, target: &Target, session: u64, code: Option<i32>) {
@@ -683,6 +809,10 @@ impl App {
         let password_vpn = self.vpn(&tunnel.vpn_id).filter(|v| !v.sso).cloned();
         let pending_cert = self.pending_cert.take();
         let next_vpn = self.next_vpn.take();
+        // Set when this tunnel was itself an automatic reconnect attempt.
+        let auto_attempt = self.reconnecting.take() == Some(tunnel.vpn_id.clone());
+        let auto_reconnect = self.vpn(&tunnel.vpn_id).is_some_and(|v| v.auto_reconnect);
+        let uptime = self.connected_at.take().map(|t| t.elapsed());
 
         // Only offer to trust the certificate if the user is still waiting
         // for this VPN, not after they disconnected or switched away.
@@ -696,11 +826,15 @@ impl App {
                 }
                 self.save_vpns();
                 self.start_auth_with(target, &tunnel.vpn_id, password_login);
+            } else {
+                self.last_error = Some(format!("The certificate for {name} wasn't trusted."));
             }
         } else if let (true, Status::Connecting(_), Some(vpn)) = (self.auth_failed, &prev, &password_vpn) {
             // Wrong password: drop any saved one and ask again.
+            self.retries = 0;
             vpn.forget_password();
             self.status = Status::SigningIn(vpn.id.clone());
+            self.last_error = Some("The gateway rejected the username or password.".to_string());
             self.open_login(target, vpn, "The gateway rejected the username or password.");
         } else {
             match prev {
@@ -708,12 +842,30 @@ impl App {
                     Some(next) => self.start_auth(target, &next),
                     None => notify("VPN disconnected", &name),
                 },
-                Status::Connected(_) => notify("VPN connection dropped", &name),
-                _ if self.sudo_failed => alert(
-                    "FortiBar needs setup",
-                    "sudo asked for a password. Run ./setup.sh in the FortiBar project folder to install the helper rule.",
-                ),
+                Status::Connected(_) => {
+                    self.last_error = Some(format!("The connection to {name} dropped."));
+                    if !auto_reconnect {
+                        notify("VPN connection dropped", &name);
+                    } else {
+                        // Up for a while: a fresh drop, not the same one again.
+                        if uptime.is_some_and(|u| u >= STABLE_AFTER) {
+                            self.retries = 0;
+                        }
+                        self.schedule_reconnect(&tunnel.vpn_id);
+                    }
+                }
+                _ if self.sudo_failed => {
+                    self.stop_reconnecting();
+                    self.fail(
+                        "FortiBar needs setup",
+                        "sudo asked for a password. Run ./setup.sh in the FortiBar project folder to install the helper rule.",
+                    )
+                }
+                // An automatic attempt failed (e.g. the network isn't back
+                // yet): try again later instead of showing an alert.
+                _ if auto_attempt && auto_reconnect => self.schedule_reconnect(&tunnel.vpn_id),
                 _ => {
+                    self.stop_reconnecting();
                     let errors: Vec<&str> = self
                         .log
                         .iter()
@@ -726,7 +878,8 @@ impl App {
                         errors.into_iter().rev().take(6).rev().collect()
                     };
                     let code = code.map_or("signal".to_string(), |c| c.to_string());
-                    alert(&format!("Couldn't connect to {name} (exit {code})"), &tail.join("\n"));
+                    let tail = tail.join("\n");
+                    self.fail(&format!("Couldn't connect to {name} (exit {code})"), &tail);
                 }
             }
         }
@@ -744,7 +897,7 @@ impl App {
         let editing = vpn.as_ref().map(|v| v.id.clone());
         let window = WindowBuilder::new()
             .with_title(title)
-            .with_inner_size(LogicalSize::new(640.0, 690.0))
+            .with_inner_size(LogicalSize::new(640.0, 800.0))
             .with_resizable(false)
             .build(target)
             .expect("create form window");
@@ -814,6 +967,9 @@ impl App {
         let Some(dns_domains) = config::parse_dns_domains(&s("dns_domains")) else {
             return show_error("DNS domains must be domain names like corp.example.com, separated by commas (at most 16).");
         };
+        let Some(keepalive_host) = config::parse_keepalive_host(&s("keepalive_host")) else {
+            return show_error("The keep-alive host must be an IP address or hostname, e.g. 10.1.2.3.");
+        };
 
         let vpn = Vpn {
             id: editing.unwrap_or_else(config::new_id),
@@ -826,6 +982,8 @@ impl App {
             username,
             save_login,
             dns_domains,
+            keepalive_host,
+            auto_reconnect: msg["auto_reconnect"].as_bool().unwrap_or(false),
         };
         match self.vpns.iter_mut().find(|v| v.id == vpn.id) {
             Some(existing) => {
@@ -914,6 +1072,97 @@ impl App {
         let auth = Auth::Password { username: username.clone(), password: password.clone() };
         self.start_tunnel(&vpn, auth, Some(PasswordLogin { username, password, typed: true }));
         self.refresh();
+    }
+}
+
+impl App {
+    // ---- AI agents (MCP) ------------------------------------------------
+
+    /// Shows an alert and keeps its text for get_status.
+    fn fail(&mut self, title: &str, message: &str) {
+        self.last_error = Some(format!("{title}: {message}"));
+        alert(title, message);
+    }
+
+    fn on_control(&mut self, target: &Target, command: Command) -> Value {
+        match command {
+            Command::Status => {}
+            Command::Logs(n) => {
+                let skip = self.log.len().saturating_sub(n);
+                let lines: Vec<&String> = self.log.iter().skip(skip).collect();
+                return json!({ "lines": lines, "status": self.status_json() });
+            }
+            Command::Connect(name) => {
+                let found = self.vpn(&name).or_else(|| self.vpns.iter().find(|v| v.name.eq_ignore_ascii_case(&name)));
+                let Some(vpn) = found.cloned() else {
+                    let names: Vec<&str> = self.vpns.iter().map(|v| v.name.as_str()).collect();
+                    let error = match names.is_empty() {
+                        true => format!("There's no VPN called “{name}”. No VPNs are set up yet."),
+                        false => format!("There's no VPN called “{name}”. The VPNs are: {}.", names.join(", ")),
+                    };
+                    return json!({ "error": error });
+                };
+                // Unlike the menu, asking again for the VPN that's already
+                // up (or coming up) leaves it alone instead of toggling it off.
+                let active = self.active_vpn() == Some(vpn.id.as_str());
+                if !active {
+                    self.connect(target, vpn.id.clone());
+                    self.refresh();
+                }
+                return json!({ "target": { "id": vpn.id, "name": vpn.name }, "status": self.status_json() });
+            }
+            Command::Disconnect => {
+                if !matches!(self.status, Status::Idle) {
+                    self.disconnect();
+                    self.refresh();
+                }
+            }
+        }
+        json!({ "status": self.status_json() })
+    }
+
+    fn status_json(&self) -> Value {
+        let (state, id) = match &self.status {
+            Status::Idle => ("disconnected", None),
+            Status::SigningIn(id) => ("signing_in", Some(id)),
+            Status::Connecting(id) => ("connecting", Some(id)),
+            Status::Connected(id) => ("connected", Some(id)),
+            Status::Disconnecting(id) => ("disconnecting", Some(id)),
+            Status::Reconnecting(id) => ("reconnecting", Some(id)),
+        };
+        // A sign-in or password window is up and only the user can finish it.
+        let waiting_for_user = match &self.status {
+            Status::SigningIn(id) => {
+                self.login.as_ref().is_some_and(|(l, ..)| l == id)
+                    || self.auth.get(id).is_some_and(|a| a.window.is_visible())
+            }
+            _ => false,
+        };
+        let vpns: Vec<Value> = self
+            .vpns
+            .iter()
+            .map(|v| {
+                json!({
+                    "id": v.id,
+                    "name": v.name,
+                    "description": v.description,
+                    "gateway": v.host_port(),
+                    "login": if v.sso { "microsoft_sso" } else { "password" },
+                    "keepalive_host": v.keepalive_host,
+                    "auto_reconnect": v.auto_reconnect,
+                })
+            })
+            .collect();
+        json!({
+            "state": state,
+            "vpn": id.map(|id| json!({ "id": id, "name": self.vpn_name(id) })),
+            "waiting_for_user": waiting_for_user,
+            "last_error": self.last_error,
+            // Automatic attempts so far while reconnecting.
+            "reconnect_attempt": (self.reconnecting.is_some() || matches!(self.status, Status::Reconnecting(_)))
+                .then_some(self.retries),
+            "vpns": vpns,
+        })
     }
 }
 

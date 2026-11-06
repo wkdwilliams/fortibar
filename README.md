@@ -100,8 +100,51 @@ This builds OpenConnect 9.21 from its release tarball and bundles it with wintun
   the password is kept in the macOS Keychain (Windows: Credential Manager) after the first
   successful connect, so later connects don't ask. With **Prompt on login** it asks every time.
   If the gateway rejects a saved password, it is deleted and you're asked again.
+- **Keep-alive Host** (Edit VPN): for gateways that drop idle connections, FortiBar pings this
+  host through the tunnel every minute while connected. Use an internal host that answers ping.
+- **Reconnect automatically** (Edit VPN): when the connection drops, FortiBar tries again after
+  2s, 5s, 15s, 30s and then every minute, and gives up after 10 attempts. It doesn't retry after
+  you disconnect, or after a rejected password or an untrusted certificate. Clicking the VPN while
+  it's waiting cancels it.
 - **Forget Saved Login** clears one VPN's browser profile, or its saved password.
 - **Show Log** opens the last tunnel output.
+
+## AI agents (MCP)
+
+FortiBar comes with `fortibar-mcp`, an [MCP](https://modelcontextprotocol.io) server, so AI agents
+(Claude Code, Claude Desktop, Cursor, …) can check the VPN, connect, disconnect and read the log.
+Add it to your agent as a stdio server with no arguments:
+
+- **macOS:** `/Applications/FortiBar.app/Contents/MacOS/fortibar-mcp` (or wherever you put the app)
+- **Windows:** `fortibar-mcp.exe`, next to `FortiBar.exe`
+
+For Claude Code:
+
+```sh
+claude mcp add fortibar -- /Applications/FortiBar.app/Contents/MacOS/fortibar-mcp
+```
+
+Or in a JSON config (Claude Desktop, Cursor):
+
+```json
+{ "mcpServers": { "fortibar": { "command": "/Applications/FortiBar.app/Contents/MacOS/fortibar-mcp" } } }
+```
+
+| Tool | What it does |
+|---|---|
+| `get_status` | Connection state, which VPN, the last error, and every configured VPN |
+| `connect` | Connects to a VPN by name or id, switching if another is up. Waits up to `wait_seconds` (default 60) for the tunnel |
+| `disconnect` | Disconnects, or cancels a sign-in in progress |
+| `get_logs` | The last `lines` (default 100) of tunnel output for the current or last connection |
+
+The agent drives the running app, so a connect works exactly like clicking the VPN in the menu.
+If the Microsoft login or a password is needed, the window opens for you, and the agent is told it's
+waiting for you. `connect` starts FortiBar if it isn't running. On Windows that shows the UAC prompt.
+The agent can't add, edit or remove VPNs, or read passwords and cookies.
+
+The app listens on a random loopback port and writes the port and a random token to `<data>/mcp.json`,
+which only your user can read. Like the sudoers rule above, that means any program running as you can
+connect and disconnect your VPNs.
 
 ## How it works
 
@@ -126,7 +169,7 @@ on Windows. Tunnel setup and DNS work the same as above.
 
 Some gateways send DNS servers but no DNS domains. FortiBar then can't tell which names belong
 to the VPN, and leaves your DNS alone. Show Log says so. Edit the VPN and list its domains under
-**DNS Domains**, e.g. `intranet.example.org`.
+**DNS Domains**, e.g. `corp.example.com`.
 
 FortiBar doesn't send all lookups through the VPN instead. macOS would tie those servers to Wi-Fi,
 so queries leave from the Wi-Fi address, and the VPN's DNS servers don't answer those.
@@ -146,6 +189,7 @@ Data lives in `~/Library/Application Support/FortiBar/` on macOS, and in `%LOCAL
 | `<data>/vpns.json` | your VPN list |
 | `<data>/<id>.cookies` | Microsoft session cookies, so logins survive app restarts |
 | `<data>/fortibar.log` | last tunnel output, written by **Show Log** |
+| `<data>/mcp.json` | port and token for `fortibar-mcp`, while FortiBar runs |
 | `<data>/profiles/` | per-VPN WebView2 profiles (Windows) |
 | Keychain / Credential Manager, service `FortiBar`, account `<id>` | saved passwords for password VPNs |
 | `/usr/local/libexec/fortibar/` | root-owned helper and openfortivpn (macOS) |

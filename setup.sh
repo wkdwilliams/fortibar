@@ -72,11 +72,13 @@ install_helper() {
 }
 
 build_app() {
-	cargo build --release --manifest-path "$ROOT/Cargo.toml"
+	cargo build --release --workspace --manifest-path "$ROOT/Cargo.toml"
 	local app="$ROOT/dist/FortiBar.app"
 	rm -rf "$app"
 	mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
 	cp "$ROOT/target/release/fortibar" "$app/Contents/MacOS/FortiBar"
+	# MCP server for AI agents; it finds the app it sits in.
+	cp "$ROOT/target/release/fortibar-mcp" "$app/Contents/MacOS/fortibar-mcp"
 	cp "$ROOT/assets/FortiBar.icns" "$app/Contents/Resources/FortiBar.icns"
 	cat >"$app/Contents/Info.plist" <<-EOF
 	<?xml version="1.0" encoding="UTF-8"?>
@@ -95,6 +97,8 @@ build_app() {
 	  <key>LSMinimumSystemVersion</key><string>14.0</string>
 	</dict></plist>
 	EOF
+	# Nested code has to be signed before the bundle around it.
+	codesign --force --sign - "$app/Contents/MacOS/fortibar-mcp" >/dev/null 2>&1 || true
 	codesign --force --sign - "$app" >/dev/null 2>&1 || true
 	echo "Built $app"
 }

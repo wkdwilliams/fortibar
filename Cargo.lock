@@ -504,6 +504,7 @@ version = "0.1.0"
 dependencies = [
  "block2",
  "embed-manifest",
+ "getrandom 0.2.17",
  "keyring",
  "libc",
  "objc2",
@@ -514,6 +515,13 @@ dependencies = [
  "tray-icon",
  "windows-sys 0.60.2",
  "wry",
+]
+
+[[package]]
+name = "fortibar-mcp"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
 ]
 
 [[package]]

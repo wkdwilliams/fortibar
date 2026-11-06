@@ -140,12 +140,63 @@ impl Tunnel {
         }
     }
 
+    /// Pings `host` through the tunnel every `KEEPALIVE_INTERVAL` until the
+    /// tunnel exits, so gateways that drop idle tunnels (often after 5 min)
+    /// keep it up. Only changes between replying and not are logged.
+    pub fn keep_alive(&self, host: String, proxy: EventLoopProxy<UserEvent>) {
+        let (exited, session) = (self.exited.clone(), self.session);
+        std::thread::spawn(move || {
+            let say = |line: String| {
+                let _ = proxy.send_event(UserEvent::TunnelLine(session, line));
+            };
+            say(format!("Keep-alive: pinging {host} every {}s", KEEPALIVE_INTERVAL.as_secs()));
+            let mut replying = true;
+            while !exited.load(Ordering::SeqCst) {
+                let reply = ping(&host);
+                if exited.load(Ordering::SeqCst) {
+                    break;
+                }
+                if reply != replying {
+                    say(match reply {
+                        true => format!("Keep-alive: {host} replies again"),
+                        false => format!("Keep-alive: no reply from {host}"),
+                    });
+                    replying = reply;
+                }
+                std::thread::sleep(KEEPALIVE_INTERVAL);
+            }
+        });
+    }
+
     pub fn wait_exit(&self, timeout: Duration) {
         let start = Instant::now();
         while !self.exited.load(Ordering::SeqCst) && start.elapsed() < timeout {
             std::thread::sleep(Duration::from_millis(100));
         }
     }
+}
+
+/// Well under FortiGate's default SSL-VPN idle timeout of 300s.
+pub const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(60);
+
+/// One echo request, waiting up to 5s for the reply. `host` is validated by
+/// config::parse_keepalive_host, so it can't be read as an option.
+fn ping(host: &str) -> bool {
+    #[cfg(unix)]
+    let mut cmd = {
+        let mut c = Command::new("/sbin/ping");
+        c.args(["-c", "1", "-t", "5", host]);
+        c
+    };
+    #[cfg(windows)]
+    let mut cmd = {
+        use std::os::windows::process::CommandExt;
+        let mut c = Command::new("ping");
+        c.args(["-n", "1", "-w", "5000", host]).creation_flags(CREATE_NO_WINDOW);
+        c
+    };
+    cmd.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+    cmd.status().is_ok_and(|s| s.success())
 }
 
 fn forward_lines(stream: impl Read + Send + 'static, session: u64, proxy: EventLoopProxy<UserEvent>) {

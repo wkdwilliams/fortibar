@@ -1,4 +1,5 @@
-# Builds dist\FortiBar-windows-x64.zip: FortiBar.exe plus a bundled openconnect.
+# Builds dist\FortiBar-windows-x64.zip: FortiBar.exe, fortibar-mcp.exe (the MCP
+# server for AI agents) and a bundled openconnect.
 #
 # Needs Rust (https://rustup.rs) and MSYS2 (https://www.msys2.org) with:
 #   pacman -S --needed make unzip mingw-w64-ucrt-x86_64-{gcc,pkgconf,gnutls,libxml2,zlib,lz4}
@@ -9,7 +10,7 @@ $ErrorActionPreference = "Stop"
 
 $root = Split-Path -Parent $PSScriptRoot
 $env:CARGO_HOME = "$root\.cargo"   # crate downloads stay in this folder
-cargo build --release --manifest-path "$root\Cargo.toml"
+cargo build --release --workspace --manifest-path "$root\Cargo.toml"
 if ($LASTEXITCODE -ne 0) { throw "cargo build failed" }
 
 $dist = "$root\dist"
@@ -17,6 +18,7 @@ $out = "$dist\FortiBar"
 Remove-Item -Recurse -Force $dist -ErrorAction SilentlyContinue
 New-Item -ItemType Directory -Force "$out\openconnect" | Out-Null
 Copy-Item "$root\target\release\fortibar.exe" "$out\FortiBar.exe"
+Copy-Item "$root\target\release\fortibar-mcp.exe" "$out\fortibar-mcp.exe"
 
 $env:MSYSTEM = "UCRT64"
 $env:CHERE_INVOKING = "1"

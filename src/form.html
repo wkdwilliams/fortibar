@@ -56,6 +56,12 @@
   <div class="row mac"><label class="l" for="dnsDomains">DNS Domains</label>
     <div><input type="text" id="dnsDomains" placeholder="optional, e.g. corp.example.com">
     <div class="hint">Names under these domains are looked up on the VPN's DNS servers. Needed when internal names don't resolve.</div></div></div>
+  <div class="row"><label class="l" for="keepaliveHost">Keep-alive Host</label>
+    <div><input type="text" id="keepaliveHost" placeholder="optional, e.g. 10.1.2.3">
+    <div class="hint">Pinged every minute while connected, for gateways that drop idle connections. Use an internal host that answers ping.</div></div></div>
+  <div class="row"><span></span>
+    <div><div class="check"><input type="checkbox" id="autoReconnect"><label for="autoReconnect">Reconnect automatically if the connection drops</label></div>
+    <div class="hint" id="reconnectHint"></div></div></div>
   <div class="err" id="err"></div>
   <div class="buttons"><button type="button" id="cancel">Cancel</button><button type="submit">Save</button></div>
 </form>
@@ -70,6 +76,9 @@
       ? 'You’re asked for the password on the first connect; it’s then kept in the '
         + (navigator.platform.startsWith('Win') ? 'Windows Credential Manager.' : 'macOS Keychain.')
       : 'You’re asked for the password every time you connect.';
+    $('reconnectHint').textContent = sso
+      ? 'Reconnects silently while the Microsoft login is still valid; otherwise the sign-in window opens.'
+      : $('save').checked ? 'Uses the saved password.' : 'Asks for the password again, since it isn’t saved.';
   };
   $('sso').onchange = $('prompt').onchange = $('save').onchange = syncAuth;
   const v = window.__VPN;
@@ -81,6 +90,8 @@
     $('sso').checked = v.sso; $('username').value = v.username;
     $(v.sso || v.save_login ? 'save' : 'prompt').checked = true;
     $('dnsDomains').value = (v.dns_domains || []).join(', ');
+    $('keepaliveHost').value = v.keepalive_host || '';
+    $('autoReconnect').checked = !!v.auto_reconnect;
   }
   if (navigator.platform.startsWith('Win')) document.querySelectorAll('.mac').forEach(r => r.classList.add('hidden'));
   syncAuth();
@@ -100,6 +111,8 @@
       save_login: $('save').checked,
       username: $('username').value.trim(),
       dns_domains: $('dnsDomains').value.trim(),
+      keepalive_host: $('keepaliveHost').value.trim(),
+      auto_reconnect: $('autoReconnect').checked,
     });
   };
   window.showError = msg => { $('err').textContent = msg; };
