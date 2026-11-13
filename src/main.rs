@@ -39,7 +39,11 @@ pub enum UserEvent {
     /// polling timer and reschedules itself; `None` comes from a page load.
     AuthCheck(String, Option<u64>),
     /// FortiGate finished SAML and redirected to 127.0.0.1:8020/?id=…
+    /// (the id is empty if the redirect didn't carry one).
     AuthSamlId(String, String),
+    /// The SAML id was exchanged this long ago and still no session cookie:
+    /// the gateway didn't accept the sign-in.
+    AuthFailed(String, u64),
     /// Sign-in didn't complete silently; show the window to the user.
     AuthReveal(String, u64),
     Form(String),
@@ -73,6 +77,9 @@ const MAX_RECONNECTS: u32 = 10;
 /// A tunnel that stayed up this long counts as working again, so the next
 /// drop starts the attempts from the beginning.
 const STABLE_AFTER: Duration = Duration::from_secs(60);
+/// How long the gateway gets to issue the session cookie once it has handed
+/// back a SAML id.
+const SAML_EXCHANGE_TIMEOUT: Duration = Duration::from_secs(10);
 
 type Target = EventLoopWindowTarget<UserEvent>;
 
@@ -116,6 +123,9 @@ struct App {
     auth_failed: bool,
     password_login: Option<PasswordLogin>,
     attempt: u64,
+    /// The current SSO sign-in has already been restarted once because the
+    /// gateway didn't issue a session cookie.
+    saml_retried: bool,
     session: u64,
     log: VecDeque<String>,
     /// Why the last connect attempt failed or dropped, for AI agents, which
@@ -167,6 +177,7 @@ fn main() {
         auth_failed: false,
         password_login: None,
         attempt: 0,
+        saml_retried: false,
         session: 0,
         log: VecDeque::new(),
         last_error: None,
@@ -567,6 +578,7 @@ impl App {
         let Some(vpn) = self.vpn(id).cloned() else { return };
         self.last_error = None;
         if vpn.sso {
+            self.saml_retried = false;
             return self.start_saml(target, &vpn);
         }
         self.status = Status::SigningIn(id.to_string());
@@ -606,6 +618,33 @@ impl App {
         self.refresh();
     }
 
+    /// The gateway ended SSO sign-in without issuing a session cookie, e.g.
+    /// because the Microsoft login (waiting for MFA) took longer than it
+    /// allows. Microsoft is signed in by now, so a fresh start usually goes
+    /// straight through; restart once, then give up.
+    fn saml_failed(&mut self, target: &Target, id: &str) {
+        let Some(vpn) = self.vpn(id).cloned() else { return };
+        if !self.saml_retried {
+            self.saml_retried = true;
+            self.push_log("FortiBar: the gateway didn't issue a session after sign-in; trying again".to_string());
+            return self.start_saml(target, &vpn);
+        }
+        if let Some(a) = self.auth.get(id) {
+            a.window.set_visible(false);
+        }
+        self.status = Status::Idle;
+        if self.reconnecting.take().as_deref() == Some(id) {
+            self.last_error = Some(format!("The gateway didn't accept the sign-in to {}.", vpn.name));
+            self.schedule_reconnect(id);
+        } else {
+            self.fail(
+                &format!("Couldn't sign in to {}", vpn.name),
+                "Microsoft sign-in finished, but the gateway didn't accept it. Try connecting again.",
+            );
+        }
+        self.refresh();
+    }
+
     fn ensure_auth_window(&mut self, target: &Target, vpn: &Vpn) {
         if self.auth.contains_key(&vpn.id) {
             return;
@@ -635,9 +674,10 @@ impl App {
             .with_navigation_handler(move |url| {
                 let local = url.starts_with("http://127.0.0.1:8020") || url.starts_with("http://localhost:8020");
                 if local {
-                    if let Some(saml_id) = query_param(&url, "id") {
-                        let _ = nav_proxy.send_event(UserEvent::AuthSamlId(nav_id.clone(), saml_id));
-                    }
+                    // Sent even without an id, so a redirect the gateway sends
+                    // when it rejects the sign-in isn't silently dropped.
+                    let saml_id = query_param(&url, "id").unwrap_or_default();
+                    let _ = nav_proxy.send_event(UserEvent::AuthSamlId(nav_id.clone(), saml_id));
                 }
                 !local
             })
@@ -745,12 +785,30 @@ impl App {
             }
             UserEvent::AuthSamlId(id, saml_id) => {
                 let signing_in = matches!(&self.status, Status::SigningIn(s) if *s == id);
+                let Some(vpn) = self.vpn(&id).filter(|_| signing_in).cloned() else { return };
                 let safe = saml_id.chars().all(|c| c.is_ascii_alphanumeric() || "-_.".contains(c));
-                if let (true, true, Some(vpn)) = (signing_in, safe, self.vpn(&id)) {
-                    // Exchanging the id sets SVPNCOOKIE in this profile.
-                    let url = format!("{}/remote/saml/auth_id?id={saml_id}", vpn.base_url());
-                    let _ = self.auth[&id].webview.load_url(&url);
+                if saml_id.is_empty() || !safe {
+                    return self.saml_failed(target, &id);
                 }
+                // Exchanging the id sets SVPNCOOKIE in this profile; polling
+                // picks it up, and AuthFailed fires if it never comes.
+                let url = format!("{}/remote/saml/auth_id?id={saml_id}", vpn.base_url());
+                let _ = self.auth[&id].webview.load_url(&url);
+                self.later(SAML_EXCHANGE_TIMEOUT, UserEvent::AuthFailed(id, self.attempt));
+            }
+            UserEvent::AuthFailed(id, attempt) => {
+                let signing_in = matches!(&self.status, Status::SigningIn(s) if *s == id);
+                if !signing_in || attempt != self.attempt {
+                    return;
+                }
+                let Some(vpn) = self.vpn(&id).cloned() else { return };
+                // One last look, in case it arrived since the last poll.
+                if let Some(cookie) = self.find_session_cookie(&vpn) {
+                    self.auth[&id].window.set_visible(false);
+                    self.start_tunnel(&vpn, Auth::Cookie(cookie), None);
+                    return self.refresh();
+                }
+                self.saml_failed(target, &id);
             }
             UserEvent::AuthReveal(id, attempt) => {
                 let signing_in = matches!(&self.status, Status::SigningIn(s) if *s == id);
