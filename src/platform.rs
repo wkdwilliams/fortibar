@@ -265,6 +265,22 @@ mod imp {
             .unwrap_or(false)
     }
 
+    /// Like `confirm`, but for a risky choice: a warning icon, and Return
+    /// picks Cancel.
+    pub fn confirm_risky(message: &str, ok: &str) -> bool {
+        let script = format!(
+            "display dialog {} with title \"FortiBar\" buttons {{\"Cancel\", {ok}}} default button \"Cancel\" cancel button \"Cancel\" with icon caution",
+            applescript_str(message),
+            ok = applescript_str(ok),
+        );
+        Command::new("osascript")
+            .arg("-e")
+            .arg(script)
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+    }
+
     pub fn open_text(path: &Path) {
         let _ = Command::new("open").arg("-e").arg(path).spawn();
     }
@@ -318,7 +334,7 @@ mod imp {
     use std::path::Path;
     use std::process::Command;
     use windows_sys::Win32::UI::WindowsAndMessaging::{
-        MessageBoxW, IDOK, MB_ICONWARNING, MB_OK, MB_OKCANCEL, MB_SETFOREGROUND, MB_TOPMOST,
+        MessageBoxW, IDOK, MB_DEFBUTTON2, MB_ICONWARNING, MB_OK, MB_OKCANCEL, MB_SETFOREGROUND, MB_TOPMOST,
     };
 
     fn wide(s: &str) -> Vec<u16> {
@@ -357,6 +373,11 @@ mod imp {
 
     pub fn confirm(message: &str, _ok: &str) -> bool {
         message_box("FortiBar", message, MB_OKCANCEL) == IDOK
+    }
+
+    /// Like `confirm`, but Enter picks Cancel.
+    pub fn confirm_risky(message: &str, _ok: &str) -> bool {
+        message_box("FortiBar", message, MB_OKCANCEL | MB_DEFBUTTON2) == IDOK
     }
 
     pub fn open_text(path: &Path) {

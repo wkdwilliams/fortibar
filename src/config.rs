@@ -32,12 +32,17 @@ pub fn data_dir() -> PathBuf {
     let base = std::env::var_os("HOME").map(|h| PathBuf::from(h).join("Library/Application Support"));
     #[cfg(not(target_os = "macos"))]
     let base = std::env::var_os("LOCALAPPDATA").map(PathBuf::from);
-    let Some(dir) = base.map(|b| b.join("FortiBar")) else {
-        return app_dir().join("data");
+    let dir = match base {
+        Some(b) => {
+            let dir = b.join("FortiBar");
+            if !dir.join("vpns.json").exists() {
+                migrate_data(&app_dir().join("data"), &dir);
+            }
+            dir
+        }
+        // No HOME / LOCALAPPDATA. Still made private below.
+        None => app_dir().join("data"),
     };
-    if !dir.join("vpns.json").exists() {
-        migrate_data(&app_dir().join("data"), &dir);
-    }
     let _ = std::fs::create_dir_all(&dir);
     // Holds saved login cookies; keep it private to this user.
     #[cfg(unix)]

@@ -17,6 +17,8 @@ export CARGO_TARGET_DIR="$ROOT/target"
 # whatever upstream HEAD is today. Bump deliberately, after reviewing changes.
 OFV_REPO=https://github.com/adrienverge/openfortivpn.git
 OFV_COMMIT=49e7b8c3881a849751aa67fc210ed5bd7054d6d5
+# Recorded with the commit, so changing how it's built forces a rebuild.
+OFV_BUILD="$OFV_COMMIT static-openssl"
 
 build_openfortivpn() {
 	local src="$VENDOR/openfortivpn-src"
@@ -39,7 +41,12 @@ build_openfortivpn() {
 	(
 		cd "$src"
 		./autogen.sh
-		PKG_CONFIG_PATH="$openssl/lib/pkgconfig" ./configure \
+		# OpenSSL is linked in statically. openfortivpn runs as root without a
+		# password prompt, and Homebrew's dylibs are writable by this user, so
+		# loading them would let anything running as this user run code as root.
+		OPENSSL_CFLAGS="-I$openssl/include" \
+		OPENSSL_LIBS="$openssl/lib/libssl.a $openssl/lib/libcrypto.a" \
+		./configure \
 			--prefix="$VENDOR/openfortivpn" \
 			--sysconfdir="$VENDOR/openfortivpn/etc" \
 			--with-pppd=/usr/sbin/pppd \
@@ -48,10 +55,44 @@ build_openfortivpn() {
 		make -j"$(sysctl -n hw.ncpu)"
 		make install
 	)
-	echo "$OFV_COMMIT" >"$VENDOR/openfortivpn/.commit"
+	echo "$OFV_BUILD" >"$VENDOR/openfortivpn/.commit"
+}
+
+# The sudoers rule trusts $BIN/fortivpn-helper by path, so every folder above
+# it must be root-owned and writable only by root. Otherwise this user could
+# move $BIN aside and put their own helper in its place.
+check_bin_parents() {
+	local d owner mode
+	d="$(dirname "$BIN")"
+	while :; do
+		if [[ -e "$d" ]]; then
+			read -r owner mode < <(stat -f '%u %Lp' "$d")
+			if [[ "$owner" != 0 || $(( 8#$mode & 8#022 )) -ne 0 ]]; then
+				echo "$d must be owned by root and not writable by group or others" \
+					"(it's owned by uid $owner, mode $mode). Fix it, then re-run setup.sh." >&2
+				exit 1
+			fi
+		fi
+		[[ "$d" == / ]] && break
+		d="$(dirname "$d")"
+	done
+}
+
+# Anything the root-run binary loads from outside the OS could be swapped by
+# this user. Only /usr/lib and /System are protected (by SIP).
+check_no_user_libs() {
+	local bad
+	bad="$(otool -L "$1" | tail -n +2 | awk '{print $1}' | grep -v -E '^(/usr/lib/|/System/)' || true)"
+	if [[ -n "$bad" ]]; then
+		echo "$1 links libraries outside the OS, which must not run as root:" >&2
+		echo "$bad" >&2
+		exit 1
+	fi
 }
 
 install_helper() {
+	check_bin_parents
+	check_no_user_libs "$VENDOR/openfortivpn/bin/openfortivpn"
 	echo "Installing root-owned helper into $BIN (needs your password)…"
 	sudo mkdir -p "$BIN"
 	# Older versions installed it inside the project folder.
@@ -110,7 +151,7 @@ fi
 
 # Rebuilt when missing or built from a different commit than the pin.
 if [[ ! -x "$VENDOR/openfortivpn/bin/openfortivpn" \
-	|| "$(cat "$VENDOR/openfortivpn/.commit" 2>/dev/null)" != "$OFV_COMMIT" ]]; then
+	|| "$(cat "$VENDOR/openfortivpn/.commit" 2>/dev/null)" != "$OFV_BUILD" ]]; then
 	build_openfortivpn
 fi
 install_helper

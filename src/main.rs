@@ -4,6 +4,7 @@ mod config;
 mod control;
 mod icon;
 mod platform;
+mod seal;
 #[cfg(target_os = "macos")]
 mod tls;
 mod tunnel;
@@ -11,7 +12,7 @@ mod tunnel;
 use config::Vpn;
 use control::Command;
 use serde_json::{json, Value};
-use platform::{alert, confirm, notify};
+use platform::{alert, confirm, confirm_risky, notify};
 use std::collections::{HashMap, VecDeque};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
@@ -187,6 +188,10 @@ fn main() {
         connected_at: None,
     };
     control::start(app.proxy.clone());
+    // Older builds saved Microsoft session cookies unencrypted. Encrypt them
+    // all now, not just when each VPN next signs in. Off the main thread, since
+    // macOS may ask for the login password before the key can be read.
+    std::thread::spawn(|| seal::migrate_dir(&config::data_dir(), "cookies"));
 
     event_loop.run(move |event, target, control_flow| {
         *control_flow = ControlFlow::Wait;
@@ -672,14 +677,17 @@ impl App {
 
         let webview = builder
             .with_navigation_handler(move |url| {
-                let local = url.starts_with("http://127.0.0.1:8020") || url.starts_with("http://localhost:8020");
-                if local {
+                if is_saml_callback(&url) {
                     // Sent even without an id, so a redirect the gateway sends
                     // when it rejects the sign-in isn't silently dropped.
                     let saml_id = query_param(&url, "id").unwrap_or_default();
                     let _ = nav_proxy.send_event(UserEvent::AuthSamlId(nav_id.clone(), saml_id));
+                    return false;
                 }
-                !local
+                // Sign-in pages are all HTTPS. Plain http (readable and
+                // changeable by anyone on the network), file: and other
+                // schemes are refused.
+                url.starts_with("https://") || url.starts_with("about:")
             })
             .with_on_page_load_handler(move |event, _url| {
                 if let PageLoadEvent::Finished = event {
@@ -719,10 +727,10 @@ impl App {
         let value = cookies
             .iter()
             .find(|c| {
+                // Only the gateway's own cookie: a parent-domain one could
+                // have been set by another host under that domain.
                 let d = c.domain().unwrap_or("").trim_start_matches('.');
-                c.name() == SESSION_COOKIE
-                    && !c.value().is_empty()
-                    && (vpn.host == d || vpn.host.ends_with(&format!(".{d}")))
+                c.name() == SESSION_COOKIE && !c.value().is_empty() && vpn.host.eq_ignore_ascii_case(d)
             })?
             .value()
             .to_string();
@@ -897,10 +905,29 @@ impl App {
         // Only offer to trust the certificate if the user is still waiting
         // for this VPN, not after they disconnected or switched away.
         if let (Some(digest), Status::Connecting(_)) = (pending_cert, &prev) {
-            let msg = format!(
-                "The certificate for {name} isn't trusted by macOS.\n\nSHA-256: {digest}\n\nTrust it for this VPN?"
-            );
-            if confirm(&msg, "Trust") {
+            let pinned = self.vpn(&tunnel.vpn_id).map(|v| v.trusted_cert.clone()).unwrap_or_default();
+            let os = if cfg!(windows) { "Windows" } else { "macOS" };
+            // A pinned certificate that changed is what someone intercepting
+            // the connection would cause, so it gets a warning, not the usual question.
+            let trusted = if !pinned.is_empty() && !pinned.eq_ignore_ascii_case(&digest) {
+                confirm_risky(
+                    &format!(
+                        "WARNING: the certificate for {name} has changed.\n\n\
+                         Someone may be intercepting your connection, for example on public Wi-Fi. \
+                         Only trust the new certificate if your IT team told you it changed.\n\n\
+                         Trusted before: {pinned}\nPresented now: {digest}"
+                    ),
+                    "Trust New Certificate",
+                )
+            } else {
+                confirm(
+                    &format!(
+                        "The certificate for {name} isn't trusted by {os}.\n\nSHA-256: {digest}\n\nTrust it for this VPN?"
+                    ),
+                    "Trust",
+                )
+            };
+            if trusted {
                 if let Some(v) = self.vpns.iter_mut().find(|v| v.id == tunnel.vpn_id) {
                     v.trusted_cert = digest;
                 }
@@ -1276,6 +1303,15 @@ fn center(window: &Window) {
     }
 }
 
+/// Where FortiGate sends the browser once SAML sign-in is done:
+/// http://127.0.0.1:8020/?id=… (or localhost). Matched exactly, so e.g.
+/// http://127.0.0.1:80200/ or http://127.0.0.1:8020@other.host/ isn't.
+fn is_saml_callback(url: &str) -> bool {
+    let Some(rest) = url.strip_prefix("http://") else { return false };
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    matches!(authority, "127.0.0.1:8020" | "localhost:8020")
+}
+
 fn query_param(url: &str, key: &str) -> Option<String> {
     let query = url.split_once('?')?.1.split('#').next()?;
     query.split('&').find_map(|pair| {
@@ -1287,25 +1323,22 @@ fn query_param(url: &str, key: &str) -> Option<String> {
 /// Session-only cookies (e.g. Microsoft's ESTSAUTH when "Stay signed in" is
 /// off) die with the app. Save them per VPN so a restart still logs in
 /// silently. Persistent cookies are already kept by the WebKit profile.
+/// They're live Microsoft sessions, so the file is encrypted (see seal.rs).
 fn save_session_cookies(vpn: &Vpn, cookies: &[Cookie<'static>]) {
     let lines: Vec<String> = cookies
         .iter()
         .filter(|c| c.name() != SESSION_COOKIE && matches!(c.expires(), None | Some(Expiration::Session)))
         .map(|c| c.to_string())
         .collect();
-    let mut options = std::fs::OpenOptions::new();
-    options.write(true).create(true).truncate(true);
-    #[cfg(unix)]
-    std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
-    let file = options.open(vpn.cookie_file());
-    if let Ok(mut f) = file {
-        use std::io::Write;
-        let _ = f.write_all(lines.join("\n").as_bytes());
+    if lines.is_empty() {
+        let _ = std::fs::remove_file(vpn.cookie_file());
+        return;
     }
+    seal::write(&vpn.cookie_file(), &lines.join("\n"));
 }
 
 fn restore_session_cookies(vpn: &Vpn, webview: &WebView) {
-    let Ok(text) = std::fs::read_to_string(vpn.cookie_file()) else { return };
+    let Some(text) = seal::read(&vpn.cookie_file()) else { return };
     for line in text.lines().filter(|l| !l.is_empty()) {
         if let Ok(c) = Cookie::parse(line.to_string()) {
             let _ = webview.set_cookie(&c);
@@ -1322,6 +1355,16 @@ mod tests {
         assert_eq!(query_param("http://127.0.0.1:8020/?id=abc123", "id").as_deref(), Some("abc123"));
         assert_eq!(query_param("http://127.0.0.1:8020/?x=1&id=Zz-9#frag", "id").as_deref(), Some("Zz-9"));
         assert_eq!(query_param("http://127.0.0.1:8020/", "id"), None);
+    }
+
+    #[test]
+    fn matches_saml_callback_exactly() {
+        assert!(is_saml_callback("http://127.0.0.1:8020/?id=abc"));
+        assert!(is_saml_callback("http://localhost:8020/?id=abc"));
+        assert!(is_saml_callback("http://127.0.0.1:8020?id=abc"));
+        assert!(!is_saml_callback("http://127.0.0.1:80200/?id=abc"));
+        assert!(!is_saml_callback("http://127.0.0.1:8020@evil.example/?id=abc"));
+        assert!(!is_saml_callback("https://127.0.0.1:8020/?id=abc"));
     }
 
     #[test]
