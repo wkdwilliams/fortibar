@@ -54,6 +54,29 @@ giving up after 10 attempts.
   Full-tunnel VPNs, and VPNs with overlapping internal ranges, can't be
   combined.
 
+## Security review (2026-11-13)
+
+Fixed:
+
+- openfortivpn links OpenSSL statically. Homebrew's dylibs are user-writable,
+  and the NOPASSWD sudo rule made loading them a passwordless root.
+  `setup.sh` (`check_no_user_libs`, `check_bin_parents`) refuses to install
+  otherwise.
+- Saved Microsoft session cookies are encrypted (`src/seal.rs`, key in the
+  Keychain/Credential Manager as `FortiBar`/`file-key`). On startup,
+  `seal::migrate_dir` encrypts any unencrypted `.cookies` left by older builds.
+- A pinned cert that changes gets a warning dialog (`confirm_risky`), not the
+  normal trust prompt.
+- The sign-in webview only navigates to https/about:. The SAML callback and the
+  `SVPNCOOKIE` domain are matched exactly.
+- The control API caps connections at 8 and limits each request to 5s in total.
+- CI: actions pinned by SHA, `contents: write` only in the tag-only release
+  job, and a `.sha256` file published with the zip.
+
+Accepted, documented in the README: the sudo rule lets any program running as
+the user start the helper against any gateway, and gateway-pushed DNS domains
+are used as is.
+
 ## Notes
 
 - This repo is public: keep client names, gateway addresses, usernames and

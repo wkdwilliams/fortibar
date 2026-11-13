@@ -7,16 +7,18 @@ on:
   pull_request:
   workflow_dispatch:
 
+# Read-only by default. Only the release job, which runs for v* tags, can write.
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   build:
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v5
+      # Actions are pinned by commit, since a tag can be moved to other code.
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
 
-      - uses: msys2/setup-msys2@v2
+      - uses: msys2/setup-msys2@ec48f7c5447b3140e2b088413ae3a55687bccb6e # v2.33.0
         id: msys2
         with:
           msystem: UCRT64
@@ -27,7 +29,7 @@ jobs:
             mingw-w64-ucrt-x86_64-gnutls mingw-w64-ucrt-x86_64-libxml2
             mingw-w64-ucrt-x86_64-zlib mingw-w64-ucrt-x86_64-lz4
 
-      - uses: actions/cache@v4
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: |
             .cargo/registry
@@ -38,13 +40,30 @@ jobs:
         shell: pwsh
         run: ./scripts/build-windows.ps1 -Msys2 "${{ steps.msys2.outputs.msys2-location }}"
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: FortiBar-windows-x64
           path: dist/FortiBar-windows-x64.zip
 
-      - name: Attach to release
-        if: startsWith(github.ref, 'refs/tags/v')
-        uses: softprops/action-gh-release@v2
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
-          files: dist/FortiBar-windows-x64.zip
+          name: FortiBar-windows-x64
+
+      - name: Attach to release, with a SHA-256 checksum
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          sha256sum FortiBar-windows-x64.zip > FortiBar-windows-x64.zip.sha256
+          cat FortiBar-windows-x64.zip.sha256
+          gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 \
+            || gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --title "$TAG" --notes "" --verify-tag
+          gh release upload "$TAG" --repo "$GITHUB_REPOSITORY" --clobber \
+            FortiBar-windows-x64.zip FortiBar-windows-x64.zip.sha256

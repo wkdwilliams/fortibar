@@ -34,7 +34,10 @@ or leave it in `dist/`. To skip the question, pass `DEST`, e.g. `make DEST=~/App
 
 `setup.sh` asks for your password once, for the steps that need root. It:
 - clones and builds [openfortivpn](https://github.com/adrienverge/openfortivpn) into `vendor/`, at the commit pinned in
-  `setup.sh` (skipped if that commit is already built)
+  `setup.sh` (skipped if that commit is already built), with OpenSSL linked in statically. Homebrew's
+  OpenSSL dylibs are writable by your user, and a root-run binary that loaded them would let any program
+  running as you run code as root. `setup.sh` refuses to install a helper that links libraries from outside
+  macOS, or into a folder whose parent folders aren't root-owned.
 - installs `fortivpn-helper` + `openfortivpn` root-owned into `/usr/local/libexec/fortibar/` and adds
   `/etc/sudoers.d/fortibar` so the app can start the tunnel without a password prompt
 - builds the app into `dist/FortiBar.app` (crates download into `.cargo/`, build output into `target/`)
@@ -42,7 +45,8 @@ or leave it in `dist/`. To skip the question, pass `DEST`, e.g. `make DEST=~/App
 The sudoers rule lets any program running as you start the helper without a password, and the helper
 connects to whatever gateway it's given and applies the routes and DNS that gateway pushes. So malware
 running as your user could redirect your traffic through a VPN of its choosing, without a password
-prompt. Don't run `setup.sh` on a machine where that trade-off isn't acceptable.
+prompt. A gateway's pushed DNS domains are used as they are, so any gateway you connect to, including a
+legitimate one, can name any domain (e.g. `google.com`) and have lookups for it go to its DNS servers. Don't run `setup.sh` on a machine where that trade-off isn't acceptable.
 
 The app doesn't depend on the project folder, so it runs from wherever you put it.
 
@@ -100,6 +104,9 @@ This builds OpenConnect 9.21 from its release tarball and bundles it with wintun
   the password is kept in the macOS Keychain (Windows: Credential Manager) after the first
   successful connect, so later connects don't ask. With **Prompt on login** it asks every time.
   If the gateway rejects a saved password, it is deleted and you're asked again.
+- After you rebuild the app on macOS, the first time it reads the Keychain (saved passwords, and the key for
+  saved Microsoft cookies), macOS asks for your login password, once per item. Choose **Always Allow**. It asks
+  again after each rebuild, because the app is signed ad hoc and each build counts as a new app.
 - **Keep-alive Host** (Edit VPN): for gateways that drop idle connections, FortiBar pings this
   host through the tunnel every minute while connected. Use an internal host that answers ping.
 - **Reconnect automatically** (Edit VPN): when the connection drops, FortiBar tries again after
@@ -177,6 +184,8 @@ so queries leave from the Wi-Fi address, and the VPN's DNS servers don't answer 
 ### Gateways with untrusted certificates
 
 If the tunnel rejects the gateway certificate, FortiBar asks whether to trust it and saves the fingerprint for that VPN.
+If a VPN's saved fingerprint later stops matching, FortiBar shows a warning instead (Cancel is the default), since
+that's what someone intercepting the connection would cause.
 On macOS the sign-in window also accepts a certificate that matches the saved fingerprint, which covers gateways
 reached by IP address. On Windows the sign-in window doesn't do this yet.
 
@@ -187,11 +196,12 @@ Data lives in `~/Library/Application Support/FortiBar/` on macOS, and in `%LOCAL
 | Path | What |
 |---|---|
 | `<data>/vpns.json` | your VPN list |
-| `<data>/<id>.cookies` | Microsoft session cookies, so logins survive app restarts |
+| `<data>/<id>.cookies` | Microsoft session cookies, so logins survive app restarts; encrypted with the `file-key` below (files from older builds are encrypted when FortiBar starts) |
 | `<data>/fortibar.log` | last tunnel output, written by **Show Log** |
 | `<data>/mcp.json` | port and token for `fortibar-mcp`, while FortiBar runs |
 | `<data>/profiles/` | per-VPN WebView2 profiles (Windows) |
 | Keychain / Credential Manager, service `FortiBar`, account `<id>` | saved passwords for password VPNs |
+| Keychain / Credential Manager, service `FortiBar`, account `file-key` | key that encrypts the `.cookies` files |
 | `/usr/local/libexec/fortibar/` | root-owned helper and openfortivpn (macOS) |
 | `vendor/` | openfortivpn source and build (macOS) |
 | `.cargo/`, `target/`, `dist/` | Rust crates, build output, packaged app |
