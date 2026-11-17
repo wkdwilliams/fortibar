@@ -12,13 +12,41 @@ so several accounts work side by side, even on the same gateway.
 
 ## macOS
 
+### Install a release (Apple Silicon)
+
+1. Download `FortiBar-macos-arm64.zip` from the latest [release](https://github.com/wkdwilliams/fortibar/releases).
+   To check it, compare `shasum -a 256 FortiBar-macos-arm64.zip` with the `.sha256` file next to it.
+2. Quit FortiBar if an older one is running, then:
+
+   ```sh
+   cd ~/Downloads
+   unzip FortiBar-macos-arm64.zip
+   bash FortiBar/install.sh
+   ```
+
+`install.sh` asks for your password, then installs the same root-owned helper and sudoers rule
+as `setup.sh` (below; the trade-off described there applies here too) and copies the app into `/Applications`.
+It only replaces an existing `/Applications/FortiBar.app` if that one is FortiBar.
+The app isn't signed with an Apple Developer ID, so `install.sh` removes the download quarantine
+from the unzipped folder. Without that, macOS would refuse to open the app. To uninstall,
+run `bash FortiBar/uninstall.sh`.
+
+Releases need macOS 12 or later on an Apple Silicon Mac. On an Intel Mac, build from source.
+
+To build a release zip yourself, run `./setup.sh --package` on an Apple Silicon Mac. It builds
+OpenSSL from its release tarball (checked against a pinned SHA-256) and openfortivpn at the pinned
+commit, and installs nothing on the Mac that builds it. The zip lands in `dist/package/`.
+
 ### Build and install
 
-You need macOS 14 or later, plus:
+You need macOS 12 or later, plus:
 
 - Xcode Command Line Tools: `xcode-select --install`
 - [Homebrew](https://brew.sh) packages: `brew install openssl@3 autoconf automake pkg-config`
 - [Rust](https://rustup.rs)
+
+On macOS 12 and 13, WebKit can't give each VPN its own browser profile, so all SSO VPNs share one
+Microsoft login, and **Forget Saved Login** on one VPN signs them all out. macOS 14 or later keeps them separate.
 
 Then:
 
@@ -69,8 +97,9 @@ Then delete the project folder.
 
 ### Install
 
-1. Download `FortiBar-windows-x64.zip` from **Actions → Windows build → Artifacts** for the latest commit
-   (you need to be signed in to GitHub), or build it yourself (below).
+1. Download `FortiBar-windows-x64.zip` from the latest [release](https://github.com/wkdwilliams/fortibar/releases),
+   or for an unreleased commit from **Actions → Windows build → Artifacts** (you need to be signed
+   in to GitHub). You can also build it yourself (below).
 2. Extract it anywhere, e.g. `C:\Tools\FortiBar`.
 3. Run `FortiBar.exe`. Windows asks for admin rights once at startup, because creating the
    tunnel adapter, routes and DNS needs them.
