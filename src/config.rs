@@ -20,7 +20,10 @@ pub fn app_dir() -> PathBuf {
     if let Some(dir) = exe.as_ref().and_then(|p| p.ancestors().find(|d| d.join("Cargo.toml").is_file())) {
         return dir.to_path_buf();
     }
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+    // Not the build folder (CARGO_MANIFEST_DIR): a prebuilt app runs on a Mac
+    // that doesn't have it, and it would put the build machine's path in the
+    // release binary.
+    exe.as_ref().and_then(|p| p.parent()).map_or_else(|| PathBuf::from("."), PathBuf::from)
 }
 
 /// macOS: ~/Library/Application Support/FortiBar, so the app works from

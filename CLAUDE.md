@@ -87,5 +87,10 @@ are used as is.
 - A helper change only takes effect after re-running `./setup.sh`, because the
   helper is installed into `/usr/local/libexec/fortibar`.
 - Releases: pushing a `v*` tag makes `.github/workflows/windows.yml` build
-  `FortiBar-windows-x64.zip` and attach it to a GitHub Release. There's no
-  macOS release asset; Mac users clone and run `make`.
+  `FortiBar-windows-x64.zip` and attach it to a GitHub Release. The macOS
+  asset isn't built by CI: run `./setup.sh --package` on an Apple Silicon Mac
+  at the tagged commit, then `gh release upload <tag>` the zip and its
+  `.sha256` from `dist/package/`.
+- `setup.sh` builds Rust without `MACOSX_DEPLOYMENT_TARGET`: proc macros built
+  for 12.0 won't load in rustc on macOS 27 ("mis-aligned LINKEDIT string
+  pool"). A warm `target/` hides this, so test on a clean one.
